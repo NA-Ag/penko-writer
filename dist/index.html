@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Privacy-focused, offline-first document editor. A free, open-source alternative to Microsoft Word and Google Docs." />
+    <meta name="theme-color" content="#3b82f6" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Penko Writer" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="icon" type="image/svg+xml" href="/penguin-logo.svg" />
+    <link rel="apple-touch-icon" href="/icons/icon-192x192.png" />
+    <title>Penko Writer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto:wght@300;400;500;700&family=Playfair+Display:wght@400;700&family=Merriweather:wght@300;400;700&family=Source+Code+Pro:wght@400;600&display=swap" rel="stylesheet">
+    <!-- Lucide Icons (Loaded via React) -->
+    <style>
+      :root {
+        --bg-color: #f8fafc;
+        --sidebar-bg: #ffffff;
+        --surface-color: #ffffff;
+      }
+      .dark {
+        --bg-color: #0f0f0f;
+        --sidebar-bg: #111111;
+        --surface-color: #1e1e1e;
+      }
+      
+      body {
+        font-family: 'Inter', sans-serif;
+        background-color: var(--bg-color);
+        overflow: hidden; /* App handles scrolling */
+        transition: background-color 0.3s ease;
+      }
+      
+      /* Modern Scrollbar */
+      ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent; 
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #cbd5e1; 
+        border-radius: 4px;
+      }
+      .dark ::-webkit-scrollbar-thumb {
+        background: #333; 
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #94a3b8; 
+      }
+
+      /* Soft Page Shadow */
+      .page-shadow {
+        box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.01);
+      }
+      .dark .page-shadow {
+        box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
+      }
+      
+      /* Editor Content Specific Styles */
+      #editor-content ul {
+        list-style-type: disc;
+        padding-left: 2em;
+        margin-bottom: 0.5em;
+      }
+      #editor-content ol {
+        list-style-type: decimal;
+        padding-left: 2em;
+        margin-bottom: 0.5em;
+      }
+      #editor-content li {
+        margin-bottom: 0.25em;
+      }
+
+      /* Selected Image Style */
+      .selected-img {
+          outline: 3px solid #3b82f6;
+          box-shadow: 0 0 0 1px white, 0 4px 6px rgba(0,0,0,0.3);
+      }
+
+      /* Print styles */
+      @media print {
+        body * {
+          visibility: hidden;
+        }
+        #editor-content, #editor-content * {
+          visibility: visible;
+        }
+        #editor-content {
+          position: absolute;
+          left: 0;
+          top: 0;
+          width: 100%;
+          margin: 0;
+          padding: 0;
+          box-shadow: none;
+        }
+        .no-print {
+          display: none !important;
+        }
+      }
+    </style>
+
+  <script type="importmap">
+{
+  "imports": {
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+    "react": "https://aistudiocdn.com/react@^19.2.0",
+    "react/": "https://aistudiocdn.com/react@^19.2.0/",
+    "lucide-react": "https://aistudiocdn.com/lucide-react@^0.554.0"
+  }
+}
+</script>
+  <script type="module" crossorigin src="/assets/index-CNAM0JZK.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/vendor-react-DwTPr_wt.js">
+  <link rel="modulepreload" crossorigin href="/assets/vendor-export-CmPVm2ts.js">
+  <link rel="modulepreload" crossorigin href="/assets/vendor-editor-DHgb9xxs.js">
+  <link rel="stylesheet" crossorigin href="/assets/index-BJA1eR7z.css">
+</head>
+  <body>
+    <div id="root"></div>
+</body>
+</html>
