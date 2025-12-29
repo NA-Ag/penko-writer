@@ -1,0 +1,30 @@
+/* Marquee scrolling animation for long track names */
+@keyframes marquee {
+  0% {
+    transform: translateX(0%);
+  }
+  50% {
+    transform: translateX(-100%);
+  }
+  50.01% {
+    transform: translateX(100%);
+  }
+  100% {
+    transform: translateX(0%);
+  }
+}
+
+.marquee-container {
+  position: relative;
+  overflow: hidden;
+}
+
+.marquee-container:hover .marquee-text {
+  animation: marquee 6s linear infinite;
+  animation-delay: 0.5s;
+}
+
+.marquee-text {
+  display: inline-block;
+  padding-right: 2em;
+}
