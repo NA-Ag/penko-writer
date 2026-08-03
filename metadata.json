@@ -1,0 +1,5 @@
+{
+  "name": "Penko Writer",
+  "description": "A free, open-source, privacy-first rich text editor built as a Progressive Web App. Features local document persistence, offline capability, and .doc export.",
+  "version": "1.0.0"
+}

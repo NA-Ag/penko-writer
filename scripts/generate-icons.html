@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Icon Generator for Penko Writer</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 20px;
+      max-width: 800px;
+      margin: 0 auto;
+    }
+    h1 {
+      color: #3b82f6;
+    }
+    .controls {
+      margin: 20px 0;
+      padding: 20px;
+      background: #f0f0f0;
+      border-radius: 8px;
+    }
+    button {
+      background: #3b82f6;
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 16px;
+      margin: 5px;
+    }
+    button:hover {
+      background: #2563eb;
+    }
+    .preview {
+      margin: 20px 0;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
+    }
+    .icon-preview {
+      text-align: center;
+    }
+    .icon-preview img {
+      border: 1px solid #ddd;
+      border-radius: 4px;
+    }
+    .icon-preview p {
+      margin: 5px 0;
+      font-size: 12px;
+      color: #666;
+    }
+    #status {
+      margin: 10px 0;
+      padding: 10px;
+      background: #e8f5e9;
+      border-radius: 4px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <h1>Penko Writer Icon Generator</h1>
+
+  <div class="controls">
+    <p>This tool generates PWA icons from the penguin-logo.svg file.</p>
+    <button onclick="generateAllIcons()">Generate All Icons</button>
+    <button onclick="downloadAllIcons()">Download All Icons as ZIP</button>
+    <div id="status"></div>
+  </div>
+
+  <div class="preview" id="preview"></div>
+
+  <canvas id="canvas" style="display: none;"></canvas>
+
+  <script>
+    const sizes = [72, 96, 128, 144, 152, 192, 384, 512];
+    const maskableSizes = [192, 512];
+    const generatedIcons = {};
+
+    // SVG content
+    const svgContent = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <defs>
+    <style>
+      .pixel { shape-rendering: crispEdges; }
+    </style>
+  </defs>
+  <rect width="32" height="32" fill="none"/>
+  <rect class="pixel" x="10" y="4" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="12" y="4" width="8" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="20" y="4" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="8" y="6" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="10" y="6" width="12" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="22" y="6" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="8" y="8" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="10" y="8" width="2" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="12" y="8" width="8" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="20" y="8" width="2" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="22" y="8" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="6" y="10" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="8" y="10" width="2" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="10" y="10" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="12" y="10" width="2" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="14" y="10" width="4" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="18" y="10" width="2" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="20" y="10" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="22" y="10" width="2" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="24" y="10" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="6" y="12" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="8" y="12" width="4" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="12" y="12" width="2" height="2" fill="#ffa500"/>
+  <rect class="pixel" x="14" y="12" width="4" height="2" fill="#ffa500"/>
+  <rect class="pixel" x="18" y="12" width="2" height="2" fill="#ffa500"/>
+  <rect class="pixel" x="20" y="12" width="4" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="24" y="12" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="6" y="14" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="8" y="14" width="4" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="12" y="14" width="8" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="20" y="14" width="4" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="24" y="14" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="4" y="16" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="6" y="16" width="2" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="8" y="16" width="4" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="12" y="16" width="8" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="20" y="16" width="4" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="24" y="16" width="2" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="26" y="16" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="4" y="18" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="6" y="18" width="2" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="8" y="18" width="4" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="12" y="18" width="8" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="20" y="18" width="4" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="24" y="18" width="2" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="26" y="18" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="6" y="20" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="8" y="20" width="4" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="12" y="20" width="8" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="20" y="20" width="4" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="24" y="20" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="8" y="22" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="10" y="22" width="12" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="22" y="22" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="8" y="24" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="10" y="24" width="4" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="14" y="24" width="4" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="18" y="24" width="4" height="2" fill="#ffffff"/>
+  <rect class="pixel" x="22" y="24" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="8" y="26" width="2" height="2" fill="#ffa500"/>
+  <rect class="pixel" x="10" y="26" width="2" height="2" fill="#ffa500"/>
+  <rect class="pixel" x="12" y="26" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="14" y="26" width="4" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="18" y="26" width="2" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="20" y="26" width="2" height="2" fill="#ffa500"/>
+  <rect class="pixel" x="22" y="26" width="2" height="2" fill="#ffa500"/>
+  <rect class="pixel" x="8" y="28" width="4" height="2" fill="#1a1a1a"/>
+  <rect class="pixel" x="20" y="28" width="4" height="2" fill="#1a1a1a"/>
+</svg>`;
+
+    function generateIcon(size, isMaskable = false) {
+      return new Promise((resolve) => {
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+
+        // Set canvas size
+        canvas.width = size;
+        canvas.height = size;
+
+        // For maskable icons, add safe zone padding (20% on each side)
+        const padding = isMaskable ? size * 0.1 : 0;
+        const iconSize = size - (padding * 2);
+
+        // Clear canvas with background
+        if (isMaskable) {
+          ctx.fillStyle = '#3b82f6';
+          ctx.fillRect(0, 0, size, size);
+        } else {
+          ctx.clearRect(0, 0, size, size);
+        }
+
+        // Create image from SVG
+        const img = new Image();
+        const blob = new Blob([svgContent], { type: 'image/svg+xml' });
+        const url = URL.createObjectURL(blob);
+
+        img.onload = function() {
+          // Draw centered with padding for maskable
+          ctx.imageSmoothingEnabled = false; // Keep crisp edges for pixel art
+          ctx.drawImage(img, padding, padding, iconSize, iconSize);
+
+          URL.revokeObjectURL(url);
+
+          canvas.toBlob((blob) => {
+            resolve({
+              size,
+              isMaskable,
+              blob,
+              dataUrl: canvas.toDataURL('image/png')
+            });
+          }, 'image/png');
+        };
+
+        img.src = url;
+      });
+    }
+
+    async function generateAllIcons() {
+      const preview = document.getElementById('preview');
+      const status = document.getElementById('status');
+
+      preview.innerHTML = '<p>Generating icons...</p>';
+      status.style.display = 'block';
+      status.innerHTML = 'Generating icons...';
+
+      // Generate regular icons
+      for (const size of sizes) {
+        const icon = await generateIcon(size, false);
+        generatedIcons[`icon-${size}x${size}.png`] = icon;
+
+        // Add to preview
+        const div = document.createElement('div');
+        div.className = 'icon-preview';
+        div.innerHTML = `
+          <img src="${icon.dataUrl}" width="${Math.min(size, 128)}" height="${Math.min(size, 128)}">
+          <p>${size}x${size}</p>
+        `;
+        preview.appendChild(div);
+      }
+
+      // Generate maskable icons
+      for (const size of maskableSizes) {
+        const icon = await generateIcon(size, true);
+        generatedIcons[`icon-maskable-${size}x${size}.png`] = icon;
+
+        // Add to preview
+        const div = document.createElement('div');
+        div.className = 'icon-preview';
+        div.innerHTML = `
+          <img src="${icon.dataUrl}" width="${Math.min(size, 128)}" height="${Math.min(size, 128)}">
+          <p>${size}x${size} (maskable)</p>
+        `;
+        preview.appendChild(div);
+      }
+
+      status.innerHTML = `✓ Generated ${Object.keys(generatedIcons).length} icons! Click "Download All Icons as ZIP" or right-click individual icons to save.`;
+    }
+
+    async function downloadAllIcons() {
+      if (Object.keys(generatedIcons).length === 0) {
+        alert('Please generate icons first!');
+        return;
+      }
+
+      // Note: This requires JSZip library for a real implementation
+      // For now, download individually
+      for (const [filename, icon] of Object.entries(generatedIcons)) {
+        const link = document.createElement('a');
+        link.download = filename;
+        link.href = icon.dataUrl;
+        link.click();
+        await new Promise(resolve => setTimeout(resolve, 100)); // Small delay between downloads
+      }
+    }
+
+    // Auto-generate on load
+    window.addEventListener('load', () => {
+      setTimeout(generateAllIcons, 100);
+    });
+  </script>
+</body>
+</html>
