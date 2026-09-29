@@ -14,9 +14,7 @@ interface TemplateDialogProps {
 }
 
 // Generate template-specific preview based on template ID
-const getTemplatePreview = (templateId: string, isDark: boolean) => {
-  const baseColor = isDark ? 'bg-current' : 'bg-current';
-
+const getTemplatePreview = (templateId: string) => {
   switch (templateId) {
     case 'blank':
       return (
@@ -281,10 +279,21 @@ const getTemplatePreview = (templateId: string, isDark: boolean) => {
 export const TemplateDialog: React.FC<TemplateDialogProps> = ({ isOpen, onClose, onSelect, darkMode, uiLanguage }) => {
   const dialogRef = useFocusTrap<HTMLDivElement>(isOpen);
 
+  React.useEffect(() => {
+    if (!isOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [isOpen, onClose]);
+
   if (!isOpen) return null;
 
   const bg = darkMode ? 'bg-zinc-900 border-zinc-800 text-gray-200 shadow-zinc-950/50' : 'bg-white border-gray-200 text-gray-900';
-  const hover = darkMode ? 'hover:bg-zinc-850' : 'hover:bg-gray-50';
 
   return (
     <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" role="dialog" aria-modal="true" aria-labelledby="template-dialog-title">
@@ -297,7 +306,7 @@ export const TemplateDialog: React.FC<TemplateDialogProps> = ({ isOpen, onClose,
             </h2>
             <p className="text-sm opacity-60 mt-1">{t(uiLanguage, 'templateDialogSubtitle')}</p>
           </div>
-          <button onClick={onClose} className="opacity-50 hover:opacity-100" aria-label="Close"><X size={24} /></button>
+          <button onClick={onClose} className="opacity-50 hover:opacity-100" aria-label={t(uiLanguage, 'close')}><X size={24} /></button>
         </div>
 
         <div className="flex-1 overflow-y-auto p-6">
@@ -306,13 +315,14 @@ export const TemplateDialog: React.FC<TemplateDialogProps> = ({ isOpen, onClose,
                <button
                  key={template.id}
                  onClick={() => onSelect(template)}
-                 className={`flex flex-col text-left group transition-all duration-200 hover:-translate-y-1 focus:outline-none`}
+                 aria-label={`${t(uiLanguage, template.nameKey)} – ${t(uiLanguage, template.categoryKey)}`}
+                 className={`flex flex-col text-left group transition-all duration-200 hover:-translate-y-1 focus:outline-none focus-visible:-translate-y-1 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-4 rounded-xl ${darkMode ? 'focus-visible:ring-offset-zinc-900' : 'focus-visible:ring-offset-white'}`}
                >
                  <div className={`aspect-[3/4] w-full rounded-xl shadow-sm border border-gray-150 dark:border-zinc-800 group-hover:shadow-xl group-hover:scale-[1.02] transition-all mb-3 relative overflow-hidden ${template.thumbnail} ${darkMode ? 'opacity-80' : ''}`}>
                     <div className="absolute inset-0 bg-gradient-to-b from-transparent to-black/5"></div>
-                    {getTemplatePreview(template.id, darkMode)}
+                    {getTemplatePreview(template.id)}
                  </div>
-                 <span className="font-semibold text-sm group-hover:text-blue-500 transition-colors">{t(uiLanguage, template.nameKey)}</span>
+                 <span className="font-semibold text-sm group-hover:text-blue-500 group-focus-visible:text-blue-500 transition-colors">{t(uiLanguage, template.nameKey)}</span>
                  <span className="text-xs opacity-50">{t(uiLanguage, template.categoryKey)}</span>
                </button>
              ))}

@@ -1,491 +1,353 @@
-// Document import utilities for various file formats
+// Document import utilities for various file formats.
+// Every importer returns HTML that has been through `prepareHtmlForEditor`.
 import mammoth from 'mammoth';
 import JSZip from 'jszip';
+import type { DocumentData, ParagraphStyle } from '../types';
+import { normalizeStyle } from './paragraphStyles';
+import { escapeHtml, prepareHtmlForEditor } from '../editor/sanitize';
+import { markdownToHtml } from './markdownConverter';
+import { parseRtf } from './rtfParser';
+import { parseOdtContent } from './odtParser';
+import { CfbReader, extractWordText, wordTextToHtml, WordBinaryError } from './wordBinary';
+import { bytesToBase64 } from './base64';
+import { DOCX_STYLE_MAP, finishDocxHtml, markDocxSections, readDocxLayout, readDocxStyles } from './docxImport';
+import { markDocxMath, restoreDocxMath } from './docxMath';
+import { t, type LanguageCode } from './translations';
+import { parsePenko, PenkoFormatError, type ParsedPenko } from './files/penkoFormat';
 
 export interface ImportResult {
   success: boolean;
   title: string;
   content: string;
   error?: string;
+  /** shown as an info toast after a successful import (e.g. "formatting was lost") */
+  warning?: string;
+  /** extra document fields (e.g. markdown source) */
+  extra?: Partial<DocumentData>;
+  /** A native .penko file: the complete document, including its id. */
+  penko?: ParsedPenko;
 }
 
+const titleOf = (file: File) => file.name.replace(/\.[^.]+$/, '') || file.name;
+
 /**
- * Import a .docx file and convert to HTML
+ * Numbers footnotes / endnotes in document order. The editor renumbers on the
+ * first edit only, so without this every imported note would show "1".
  */
-export async function importDocx(file: File): Promise<ImportResult> {
+export const numberNotes = (html: string): string => {
+  if (!html.includes('data-type="footnote"')) return html;
+  const body = new DOMParser().parseFromString(`<!DOCTYPE html><body>${html}</body>`, 'text/html').body;
+  const counters = { footnote: 0, endnote: 0 };
+  body.querySelectorAll('sup[data-type="footnote"]').forEach(sup => {
+    const kind = sup.getAttribute('data-note-type') === 'endnote' ? 'endnote' : 'footnote';
+    sup.setAttribute('data-number', String(++counters[kind]));
+  });
+  return body.innerHTML;
+};
+
+const ok = (file: File, html: string, more: Partial<ImportResult> = {}): ImportResult => ({
+  success: true,
+  title: titleOf(file),
+  content: numberNotes(prepareHtmlForEditor(html)) || '<p></p>',
+  ...more,
+});
+
+const fail = (file: File, error: string): ImportResult => ({ success: false, title: file.name, content: '', error });
+
+const errMsg = (error: unknown, fallback: string) => (error instanceof Error && error.message ? error.message : fallback);
+
+const MIME_BY_EXT: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp', svg: 'image/svg+xml' };
+
+/**
+ * Import a .docx file via mammoth (body, images inlined as base64) plus what
+ * mammoth ignores: alignment, page setup, header / footer and page numbers,
+ * footnotes as real notes, page breaks and screenplay styles (docxImport.ts).
+ */
+export async function importDocx(file: File, lang: LanguageCode = 'en-US'): Promise<ImportResult> {
   try {
     const arrayBuffer = await file.arrayBuffer();
-
+    const zip = await JSZip.loadAsync(arrayBuffer).catch(() => null);
+    const [layout, named] = zip ? await Promise.all([readDocxLayout(zip), readDocxStyles(zip)]) : [{ aligns: null, extra: {}, sections: [] }, { styleMap: [], styles: [] }];
+    // section breaks are marked in the XML last (it rewrites document.xml)
+    const marked = zip ? await markDocxSections(zip, await markDocxMath(zip, arrayBuffer)) : arrayBuffer;
     const result = await mammoth.convertToHtml(
-      { arrayBuffer },
+      { arrayBuffer: marked },
       {
-        styleMap: [
-          // Map Word styles to HTML/CSS
-          "p[style-name='Heading 1'] => h1:fresh",
-          "p[style-name='Heading 2'] => h2:fresh",
-          "p[style-name='Heading 3'] => h3:fresh",
-          "p[style-name='Heading 4'] => h4:fresh",
-          "p[style-name='Title'] => h1.title:fresh",
-          "p[style-name='Subtitle'] => h2.subtitle:fresh",
-          "r[style-name='Strong'] => strong",
-          "r[style-name='Emphasis'] => em",
-        ],
-        convertImage: mammoth.images.imgElement(async (image) => {
-          // Convert images to base64 data URLs
-          const buffer = await image.read();
-          const base64 = arrayBufferToBase64(buffer);
-          const contentType = image.contentType || 'image/png';
-          return {
-            src: `data:${contentType};base64,${base64}`,
-          };
+        // custom Word styles first: mammoth uses the first matching rule
+        styleMap: [...named.styleMap, ...DOCX_STYLE_MAP],
+        convertImage: mammoth.images.imgElement(async image => {
+          const base64 = await image.read('base64');
+          return { src: `data:${image.contentType || 'image/png'};base64,${base64}` };
         }),
-      }
+      },
     );
-
-    // Log any conversion messages/warnings
-    if (result.messages.length > 0) {
-      console.log('[Import] Docx conversion messages:', result.messages);
-    }
-
-    return {
-      success: true,
-      title: file.name.replace(/\.docx$/i, ''),
-      content: result.value,
-    };
+    const { html, screenplay } = finishDocxHtml(restoreDocxMath(result.value), layout.aligns, layout.sections);
+    const extra: Partial<DocumentData> = { ...layout.extra, ...(screenplay ? { isScreenplay: true } : named.styles.length ? { styles: named.styles } : {}) };
+    return ok(file, html, Object.keys(extra).length ? { extra } : {});
   } catch (error) {
     console.error('[Import] Docx import error:', error);
-    return {
-      success: false,
-      title: file.name,
-      content: '',
-      error: error instanceof Error ? error.message : 'Failed to import DOCX file',
-    };
+    return fail(file, errMsg(error, t(lang, 'importDocxFailed')));
   }
 }
 
 /**
- * Import a .doc file (legacy Word format)
- * Note: Full .doc support requires complex parsing. This is a basic implementation.
+ * Import a legacy binary .doc (Word 97-2003 / Word 6-95). Text only: the
+ * text is read from the WordDocument stream via the piece table.
+ * Many ".doc" files are really RTF or HTML — those are imported with formatting.
  */
-export async function importDoc(file: File): Promise<ImportResult> {
+export async function importDoc(file: File, lang: LanguageCode = 'en-US'): Promise<ImportResult> {
   try {
-    // Legacy .doc format is binary and complex
-    // For basic text extraction, we'll try to parse as plain text
-    const text = await file.text();
-
-    // Remove binary garbage and extract readable text
-    const cleaned = text
-      .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F-\x9F]/g, '') // Remove control characters
-      .replace(/[^\x20-\x7E\n\r\t]/g, '') // Keep only printable ASCII
-      .trim();
-
-    // Wrap in paragraphs
-    const paragraphs = cleaned
-      .split(/\n+/)
-      .filter(p => p.trim().length > 0)
-      .map(p => `<p>${escapeHtml(p.trim())}</p>`)
-      .join('');
-
-    return {
-      success: true,
-      title: file.name.replace(/\.doc$/i, ''),
-      content: paragraphs || '<p><br></p>',
-    };
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const head = new TextDecoder('latin1').decode(bytes.subarray(0, 512)).trimStart();
+    if (head.startsWith('{\\rtf')) return importRtf(file, lang);
+    if (/^(<!doctype html|<html|mime-version:)/i.test(head) || /<html[\s>]/i.test(head)) {
+      const res = await importHtml(file, lang);
+      return { ...res, title: titleOf(file) };
+    }
+    if (!CfbReader.isCfb(bytes)) return fail(file, t(lang, 'importDocUnreadable'));
+    const raw = extractWordText(bytes);
+    const html = wordTextToHtml(raw, escapeHtml);
+    if (!html.replace(/<[^>]+>/g, '').trim()) return fail(file, t(lang, 'importDocUnreadable'));
+    return ok(file, html, { warning: t(lang, 'importDocFormattingLost') });
   } catch (error) {
     console.error('[Import] Doc import error:', error);
-    return {
-      success: false,
-      title: file.name,
-      content: '',
-      error: 'Legacy .doc format has limited support. Please convert to .docx for best results.',
-    };
+    if (error instanceof WordBinaryError && error.code === 'encrypted') return fail(file, t(lang, 'importDocEncrypted'));
+    return fail(file, t(lang, 'importDocUnreadable'));
   }
 }
 
-/**
- * Import a .txt file
- */
-export async function importTxt(file: File): Promise<ImportResult> {
+/** Plain text: blank lines separate paragraphs, single newlines become <br>. */
+export const plainTextToHtml = (text: string): string =>
+  text
+    .replace(/\r\n?/g, '\n')
+    .split(/\n{2,}/)
+    .map(p => `<p>${p.split('\n').map(escapeHtml).join('<br>')}</p>`)
+    .join('');
+
+export async function importTxt(file: File, lang: LanguageCode = 'en-US'): Promise<ImportResult> {
   try {
-    const text = await file.text();
-
-    // Convert plain text to HTML paragraphs
-    const paragraphs = text
-      .split(/\n\n+/) // Double newlines = paragraph breaks
-      .map(paragraph => {
-        const lines = paragraph
-          .split('\n')
-          .map(line => escapeHtml(line))
-          .join('<br>');
-        return `<p>${lines}</p>`;
-      })
-      .join('');
-
-    return {
-      success: true,
-      title: file.name.replace(/\.txt$/i, ''),
-      content: paragraphs || '<p><br></p>',
-    };
+    return ok(file, plainTextToHtml(await file.text()));
   } catch (error) {
-    console.error('[Import] Txt import error:', error);
-    return {
-      success: false,
-      title: file.name,
-      content: '',
-      error: error instanceof Error ? error.message : 'Failed to import text file',
-    };
+    return fail(file, errMsg(error, t(lang, 'importFailed')));
   }
 }
 
+/** Page breaks written by Word / our .doc export as `<br style="page-break-before:always">`. */
+const convertHtmlPageBreaks = (root: Element) =>
+  root.querySelectorAll('br[style*="page-break-before"], br[style*="break-before"]').forEach(br => {
+    const pb = root.ownerDocument.createElement('div');
+    pb.setAttribute('data-type', 'page-break');
+    br.replaceWith(pb);
+  });
+
 /**
- * Import an .html file
+ * HTML: body contents, sanitized (scripts, handlers, unsafe URLs removed).
+ * Files exported by Penko Writer (HTML / .doc) give back just the document
+ * content — the rendered header / footer band and note list are dropped
+ * (the notes live on in the footnote markers).
  */
-export async function importHtml(file: File): Promise<ImportResult> {
+export async function importHtml(file: File, lang: LanguageCode = 'en-US'): Promise<ImportResult> {
   try {
     const html = await file.text();
-
-    // Extract content from body tag if present
-    const bodyMatch = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
-    const content = bodyMatch ? bodyMatch[1] : html;
-
-    // Sanitize (basic - remove script tags)
-    const sanitized = content.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
-
-    return {
-      success: true,
-      title: file.name.replace(/\.html?$/i, ''),
-      content: sanitized.trim() || '<p><br></p>',
-    };
-  } catch (error) {
-    console.error('[Import] HTML import error:', error);
-    return {
-      success: false,
-      title: file.name,
-      content: '',
-      error: error instanceof Error ? error.message : 'Failed to import HTML file',
-    };
-  }
-}
-
-/**
- * Import a .odt file (OpenDocument Text)
- */
-export async function importOdt(file: File): Promise<ImportResult> {
-  try {
-    const arrayBuffer = await file.arrayBuffer();
-    const zip = await JSZip.loadAsync(arrayBuffer);
-
-    // ODT files are ZIP archives containing XML
-    const contentXml = await zip.file('content.xml')?.async('text');
-    if (!contentXml) {
-      throw new Error('Invalid ODT file: content.xml not found');
-    }
-
-    // Parse XML and extract text content
-    const parser = new DOMParser();
-    const xmlDoc = parser.parseFromString(contentXml, 'text/xml');
-
-    // Extract all text:p (paragraph) elements
-    const paragraphs = xmlDoc.getElementsByTagNameNS('urn:oasis:names:tc:opendocument:xmlns:text:1.0', 'p');
-    const html: string[] = [];
-
-    for (let i = 0; i < paragraphs.length; i++) {
-      const p = paragraphs[i];
-      const text = p.textContent?.trim() || '';
-      if (text) {
-        // Check if it's a heading
-        const styleName = p.getAttribute('text:style-name') || '';
-        if (styleName.toLowerCase().includes('heading')) {
-          html.push(`<h2>${escapeHtml(text)}</h2>`);
-        } else {
-          html.push(`<p>${escapeHtml(text)}</p>`);
-        }
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const title = doc.querySelector('title')?.textContent?.trim();
+    const fromPenko = Array.from(doc.querySelectorAll('meta')).some(m => m.getAttribute('name')?.toLowerCase() === 'generator' && m.getAttribute('content') === 'Penko Writer');
+    const root = (fromPenko && doc.querySelector('.penko-doc > .ProseMirror, .WordSection1')) || doc.body;
+    const extra: Partial<DocumentData> = {};
+    if (fromPenko) {
+      root.querySelectorAll('.penko-notes, .penko-hf').forEach(el => el.remove());
+      if (doc.querySelector('.penko-doc.screenplay-mode') || root.querySelector('[data-screenplay-type]')) extra.isScreenplay = true;
+      const docLang = doc.documentElement.getAttribute('lang') || doc.body.getAttribute('lang');
+      if (docLang && /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(docLang)) extra.language = docLang;
+      // named paragraph styles written by our HTML export
+      try {
+        const raw = JSON.parse(doc.querySelector('meta[name="penko-styles"]')?.getAttribute('content') || 'null');
+        const styles = Array.isArray(raw) ? raw.map(normalizeStyle).filter((s): s is ParagraphStyle => !!s) : [];
+        if (styles.length) extra.styles = styles;
+      } catch {
+        /* not ours / malformed */
       }
     }
+    if (root) convertHtmlPageBreaks(root);
+    return { ...ok(file, root ? root.innerHTML : html, Object.keys(extra).length ? { extra } : {}), title: title || titleOf(file) };
+  } catch (error) {
+    return fail(file, errMsg(error, t(lang, 'importFailed')));
+  }
+}
 
-    return {
-      success: true,
-      title: file.name.replace(/\.odt$/i, ''),
-      content: html.join('') || '<p><br></p>',
-    };
+/** OpenDocument Text via a real XML walk (see odtParser.ts). */
+export async function importOdt(file: File, lang: LanguageCode = 'en-US'): Promise<ImportResult> {
+  try {
+    const zip = await JSZip.loadAsync(await file.arrayBuffer());
+    const contentXml = await zip.file('content.xml')?.async('text');
+    if (!contentXml) throw new Error(t(lang, 'importOdtInvalid'));
+    const stylesXml = await zip.file('styles.xml')?.async('text');
+    const images: Record<string, string> = {};
+    const pictures = Object.keys(zip.files).filter(name => /^Pictures\//.test(name) && !zip.files[name].dir);
+    for (const name of pictures) {
+      const ext = (name.split('.').pop() || '').toLowerCase();
+      const mime = MIME_BY_EXT[ext];
+      if (!mime) continue;
+      const data = await zip.file(name)!.async('uint8array');
+      images[name] = `data:${mime};base64,${bytesToBase64(data)}`;
+    }
+    return ok(file, parseOdtContent(contentXml, { stylesXml, images }));
   } catch (error) {
     console.error('[Import] ODT import error:', error);
-    return {
-      success: false,
-      title: file.name,
-      content: '',
-      error: error instanceof Error ? error.message : 'Failed to import ODT file',
-    };
+    return fail(file, t(lang, 'importOdtInvalid'));
   }
 }
 
-/**
- * Import a .rtf file (Rich Text Format)
- */
-export async function importRtf(file: File): Promise<ImportResult> {
+/** RTF via a real tokenizer (see rtfParser.ts). */
+export async function importRtf(file: File, lang: LanguageCode = 'en-US'): Promise<ImportResult> {
   try {
-    const text = await file.text();
-
-    // Basic RTF to HTML conversion
-    // Remove RTF control words and convert to HTML
-    let html = text
-      // Remove RTF header
-      .replace(/\{\\rtf1[^}]*\}/g, '')
-      // Convert bold (\b text\b0)
-      .replace(/\\b\s+([^\\]+?)\\b0/g, '<strong>$1</strong>')
-      // Convert italic (\i text\i0)
-      .replace(/\\i\s+([^\\]+?)\\i0/g, '<em>$1</em>')
-      // Convert underline (\ul text\ul0)
-      .replace(/\\ul\s+([^\\]+?)\\ul0/g, '<u>$1</u>')
-      // Convert paragraphs (\par)
-      .replace(/\\par\s*/g, '</p><p>')
-      // Remove remaining RTF control words
-      .replace(/\\[a-z]+(-?\d+)?[ ]?/g, '')
-      // Remove curly braces
-      .replace(/[{}]/g, '')
-      // Clean up whitespace
-      .trim();
-
-    // Wrap in paragraph tags
-    if (!html.startsWith('<p>')) {
-      html = '<p>' + html + '</p>';
-    }
-
-    // Clean up empty paragraphs
-    html = html.replace(/<p>\s*<\/p>/g, '<p><br></p>');
-
-    return {
-      success: true,
-      title: file.name.replace(/\.rtf$/i, ''),
-      content: html || '<p><br></p>',
-    };
+    // RTF is 7-bit; decode as latin1 so stray 8-bit bytes don't become U+FFFD
+    const text = new TextDecoder('latin1').decode(await file.arrayBuffer());
+    if (!text.trimStart().startsWith('{\\rtf')) throw new Error(t(lang, 'importRtfInvalid'));
+    return ok(file, parseRtf(text).html);
   } catch (error) {
     console.error('[Import] RTF import error:', error);
-    return {
-      success: false,
-      title: file.name,
-      content: '',
-      error: 'RTF import has basic support. Some formatting may be lost.',
-    };
+    return fail(file, errMsg(error, t(lang, 'importRtfInvalid')));
   }
 }
 
-/**
- * Import a .md (Markdown) file
- */
-export async function importMarkdown(file: File): Promise<ImportResult> {
+/** Markdown (GFM) via marked. */
+export async function importMarkdown(file: File, lang: LanguageCode = 'en-US'): Promise<ImportResult> {
   try {
-    const text = await file.text();
+    return ok(file, markdownToHtml(await file.text()));
+  } catch (error) {
+    return fail(file, errMsg(error, t(lang, 'importFailed')));
+  }
+}
 
-    // Basic Markdown to HTML conversion
-    let html = text
-      // Headers
-      .replace(/^### (.*$)/gim, '<h3>$1</h3>')
-      .replace(/^## (.*$)/gim, '<h2>$1</h2>')
-      .replace(/^# (.*$)/gim, '<h1>$1</h1>')
-      // Bold
-      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      .replace(/__(.+?)__/g, '<strong>$1</strong>')
-      // Italic
-      .replace(/\*(.+?)\*/g, '<em>$1</em>')
-      .replace(/_(.+?)_/g, '<em>$1</em>')
-      // Links
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
-      // Line breaks -> paragraphs
-      .split('\n\n')
-      .map(p => {
-        if (p.trim().startsWith('<h') || p.trim() === '') {
-          return p;
-        }
-        return `<p>${p.replace(/\n/g, '<br>')}</p>`;
-      })
-      .join('');
+const PENKO_ERRORS: Record<string, string> = {
+  notPenko: 'penkoErrorNotPenko',
+  wordFile: 'penkoErrorWordFile',
+  damaged: 'penkoErrorDamaged',
+  tooNew: 'penkoErrorTooNew',
+  tooLarge: 'penkoErrorTooLarge',
+};
 
+/** Native .penko file: the whole document with every setting (see files/penkoFormat.ts). */
+export async function importPenko(file: File, lang: LanguageCode = 'en-US'): Promise<ImportResult> {
+  try {
+    const penko = await parsePenko(await file.arrayBuffer());
     return {
       success: true,
-      title: file.name.replace(/\.md$/i, ''),
-      content: html || '<p><br></p>',
+      title: penko.doc.title || titleOf(file),
+      content: penko.doc.content,
+      penko,
+      ...(penko.newerVersion ? { warning: t(lang, 'penkoNewerVersion') } : {}),
     };
   } catch (error) {
-    console.error('[Import] Markdown import error:', error);
-    return {
-      success: false,
-      title: file.name,
-      content: '',
-      error: error instanceof Error ? error.message : 'Failed to import Markdown file',
-    };
+    console.error('[Import] .penko import error:', error);
+    const key = error instanceof PenkoFormatError ? PENKO_ERRORS[error.code] : 'penkoErrorDamaged';
+    return fail(file, t(lang, key || 'penkoErrorDamaged'));
   }
 }
 
-/**
- * Main import function - detects file type and routes to appropriate importer
- */
-export async function importDocument(file: File): Promise<ImportResult> {
-  const extension = file.name.toLowerCase().split('.').pop();
-
+/** Main import function - detects file type and routes to the right importer. */
+export async function importDocument(file: File, lang: LanguageCode = 'en-US'): Promise<ImportResult> {
+  const extension = (file.name.toLowerCase().split('.').pop() || '').trim();
   switch (extension) {
+    case 'penko':
+      return importPenko(file, lang);
     case 'docx':
-      return importDocx(file);
+      return importDocx(file, lang);
     case 'doc':
-      return importDoc(file);
+      return importDoc(file, lang);
     case 'txt':
-      return importTxt(file);
+      return importTxt(file, lang);
     case 'html':
     case 'htm':
-      return importHtml(file);
+      return importHtml(file, lang);
     case 'odt':
-      return importOdt(file);
+      return importOdt(file, lang);
     case 'rtf':
-      return importRtf(file);
+      return importRtf(file, lang);
     case 'md':
-      return importMarkdown(file);
+    case 'markdown':
+      return importMarkdown(file, lang);
     default:
-      return {
-        success: false,
-        title: file.name,
-        content: '',
-        error: `Unsupported file format: .${extension}. Supported formats: .docx, .doc, .txt, .html, .odt, .rtf, .md`,
-      };
+      return fail(file, t(lang, 'importUnsupportedFormat').replace('{ext}', extension ? `.${extension}` : file.name));
   }
 }
 
-/**
- * Helper: Convert ArrayBuffer to Base64
- */
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
+export const MAX_IMPORT_BYTES = 50 * 1024 * 1024;
 
-/**
- * Helper: Escape HTML entities
- */
-function escapeHtml(text: string): string {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-}
-
-/**
- * Validate file size (max 50MB)
- */
-export function validateFileSize(file: File): { valid: boolean; error?: string } {
-  const maxSize = 50 * 1024 * 1024; // 50MB
-  if (file.size > maxSize) {
-    return {
-      valid: false,
-      error: `File too large. Maximum size is 50MB. Your file is ${(file.size / 1024 / 1024).toFixed(2)}MB.`,
-    };
+/** Validate file size (max 50MB) */
+export function validateFileSize(file: File, lang: LanguageCode = 'en-US'): { valid: boolean; error?: string } {
+  if (file.size > MAX_IMPORT_BYTES) {
+    return { valid: false, error: t(lang, 'importFileTooLarge').replace('{size}', (file.size / 1024 / 1024).toFixed(2)) };
   }
   return { valid: true };
 }
 
-/**
- * Get supported file extensions
- */
 export function getSupportedExtensions(): string[] {
-  return ['docx', 'doc', 'txt', 'html', 'htm', 'odt', 'rtf', 'md'];
+  return ['penko', 'docx', 'doc', 'txt', 'html', 'htm', 'odt', 'rtf', 'md'];
 }
 
-/**
- * Get file accept string for input element
- */
 export function getFileAcceptString(): string {
-  return '.docx,.doc,.txt,.html,.htm,.odt,.rtf,.md';
+  return '.penko,.docx,.doc,.txt,.html,.htm,.odt,.rtf,.md,.markdown';
 }
 
+/* ------------------------------------------------------------------ */
+/* Archive (backup ZIP) restore                                        */
+/* ------------------------------------------------------------------ */
+
+const ARCHIVE_FIELDS: (keyof DocumentData)[] = [
+  'title', 'content', 'createdAt', 'lastModified', 'pageConfig', 'language', 'header', 'footer', 'showPageNumbers',
+  'pageNumberPosition', 'differentFirstPage', 'pageNumberFormat', 'comments', 'trackingEnabled', 'currentUser', 'citations', 'isScreenplay', 'isMarkdownMode', 'markdownSource',
+];
+
 /**
- * Import documents from a ZIP archive
+ * Reads documents from a backup ZIP made by "Export All as ZIP".
+ * Returns partial documents (no ids — the caller creates fresh documents).
  */
-export async function importArchive(file: File): Promise<{
+export async function importArchive(file: File, lang: LanguageCode = 'en-US'): Promise<{
   success: boolean;
-  documents: any[];
+  documents: Partial<DocumentData>[];
   error?: string;
+  skipped: number;
 }> {
   try {
-    const arrayBuffer = await file.arrayBuffer();
-    const zip = await JSZip.loadAsync(arrayBuffer);
+    const zip = await JSZip.loadAsync(await file.arrayBuffer());
+    const jsonFiles = Object.keys(zip.files).filter(name => {
+      const base = name.split('/').pop() || '';
+      return !zip.files[name].dir && base.endsWith('.json') && base !== 'metadata.json' && !name.startsWith('__MACOSX') && !base.startsWith('._');
+    });
+    if (!jsonFiles.length) return { success: false, documents: [], error: t(lang, 'archiveNoDocuments'), skipped: 0 };
 
-    const documents: any[] = [];
-    const errors: string[] = [];
-
-    // Find all JSON files in the archive
-    const jsonFiles = Object.keys(zip.files).filter(filename =>
-      filename.endsWith('.json') && filename !== 'metadata.json' && !filename.startsWith('__MACOSX')
-    );
-
-    if (jsonFiles.length === 0) {
-      return {
-        success: false,
-        documents: [],
-        error: 'No document files found in archive',
-      };
-    }
-
-    // Parse each JSON file
-    for (const filename of jsonFiles) {
+    const documents: Partial<DocumentData>[] = [];
+    let skipped = 0;
+    for (const name of jsonFiles.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))) {
       try {
-        const content = await zip.file(filename)?.async('text');
-        if (content) {
-          const docData = JSON.parse(content);
-
-          // Validate required fields
-          if (!docData.title || !docData.content) {
-            errors.push(`Invalid document in ${filename}: missing title or content`);
-            continue;
-          }
-
-          // Generate new ID to avoid conflicts
-          const importedDoc = {
-            id: crypto.randomUUID(),
-            title: docData.title + ' (imported)',
-            content: docData.content,
-            createdAt: Date.now(),
-            lastModified: Date.now(),
-            pageConfig: docData.pageConfig,
-            language: docData.language,
-            header: docData.header,
-            footer: docData.footer,
-            showPageNumbers: docData.showPageNumbers,
-            pageNumberPosition: docData.pageNumberPosition,
-            comments: docData.comments || [],
-            trackChanges: docData.trackChanges || [],
-            trackingEnabled: docData.trackingEnabled || false,
-            currentUser: docData.currentUser,
-          };
-
-          documents.push(importedDoc);
+        const data = JSON.parse((await zip.file(name)!.async('text')) || 'null');
+        if (!data || typeof data !== 'object' || typeof data.content !== 'string') {
+          skipped++;
+          continue;
         }
-      } catch (err) {
-        errors.push(`Failed to parse ${filename}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        const doc: Partial<DocumentData> = {};
+        for (const key of ARCHIVE_FIELDS) if (data[key] !== undefined) (doc as any)[key] = data[key];
+        doc.title = typeof data.title === 'string' && data.title.trim() ? data.title : t(lang, 'untitledDocument');
+        doc.content = prepareHtmlForEditor(data.content);
+        if (!Array.isArray(doc.comments)) delete doc.comments;
+        // Paragraph styles: validated like in .penko files
+        if (Array.isArray(data.styles)) {
+          doc.styles = data.styles
+            .map((st: unknown) => (st && typeof st === 'object' && typeof (st as any).id === 'string' ? normalizeStyle(st as any) : null))
+            .filter((st: ParagraphStyle | null): st is ParagraphStyle => !!st);
+        }
+        if (!Array.isArray(doc.citations)) delete doc.citations;
+        documents.push(doc);
+      } catch {
+        skipped++;
       }
     }
-
-    if (documents.length === 0) {
-      return {
-        success: false,
-        documents: [],
-        error: errors.length > 0 ? errors.join('\n') : 'No valid documents found in archive',
-      };
-    }
-
-    console.log(`[Import] Successfully imported ${documents.length} documents from archive`);
-
-    return {
-      success: true,
-      documents,
-      error: errors.length > 0 ? `Imported ${documents.length} documents with ${errors.length} errors` : undefined,
-    };
+    if (!documents.length) return { success: false, documents: [], error: t(lang, 'archiveNoDocuments'), skipped };
+    return { success: true, documents, skipped };
   } catch (error) {
     console.error('[Import] Archive import error:', error);
-    return {
-      success: false,
-      documents: [],
-      error: error instanceof Error ? error.message : 'Failed to import archive',
-    };
+    return { success: false, documents: [], error: t(lang, 'archiveInvalid'), skipped: 0 };
   }
 }

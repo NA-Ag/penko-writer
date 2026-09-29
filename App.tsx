@@ -1,20 +1,29 @@
 import React from 'react';
-import { AppProvider, useApp } from './AppContext';
+import { AppProvider, useApp, useSelectionContext } from './AppContext';
+import { FilesProvider } from './state/FilesContext';
+import type { ComponentProps } from 'react';
 import { Ribbon } from './components/Ribbon';
 import { Editor } from './components/Editor';
-import { MarkdownEditor } from './components/MarkdownEditor';
 import { StatusBar } from './components/StatusBar';
 import { Sidebar } from './components/Sidebar';
 import { Ruler } from './components/Ruler';
 import { DialogsContainer } from './components/DialogsContainer';
 import { PenkoAssistant } from './components/PenkoAssistant';
-import { MobileChatEditor } from './components/MobileChatEditor';
-import { FocusMode } from './components/FocusMode';
-import { Minimize2 } from 'lucide-react';
-import { saveToStorage } from './utils/storage';
+
+// Loaded on demand: the mobile layout only on phones, the markdown editor only in markdown mode
+const MobileChatEditor = React.lazy(() => import('./components/MobileChatEditor').then(m => ({ default: m.MobileChatEditor })));
+const MarkdownEditor = React.lazy(() => import('./components/MarkdownEditor').then(m => ({ default: m.MarkdownEditor })));
+
+/** Only the ribbon follows the selection; the rest of the layout doesn't re-render as the caret moves. */
+const SelectionAwareRibbon: React.FC<Omit<ComponentProps<typeof Ribbon>, 'selectionContext'>> = props => {
+  const { selectionContext } = useSelectionContext();
+  return <Ribbon {...props} selectionContext={selectionContext} />;
+};
 
 const MainLayout: React.FC = () => {
   const {
+    contentRevision,
+    pageInfo,
     documents,
     currentDoc,
     isSidebarOpen,
@@ -31,38 +40,29 @@ const MainLayout: React.FC = () => {
     showOutline,
     setShowOutline,
     setShowDiagramEditor,
-    showHeaderFooter, setShowHeaderFooter,
-    showLinkDialog,
-    showCommentsPanel, setShowCommentsPanel,
-    showTrackChangesPanel, setShowTrackChangesPanel,
-    showImportDialog, setShowImportDialog,
-    showCollaborationDialog, setShowCollaborationDialog,
-    showEquationDialog, setShowEquationDialog,
-    showTOCDialog, setShowTOCDialog,
-    showFootnoteDialog, setShowFootnoteDialog,
-    showCitationDialog, setShowCitationDialog,
-    showCodeBlockDialog, setShowCodeBlockDialog,
-    showImageGallery, setShowImageGallery,
-    showKeyboardShortcuts, setShowKeyboardShortcuts,
-    currentUser,
+    openHeaderFooter,
+    setShowCommentsPanel,
+    setShowTrackChangesPanel,
+    setShowImportDialog,
+    setShowCollaborationDialog,
+    setShowEquationDialog,
+    setShowTOCDialog,
+    setShowFootnoteDialog,
+    setShowCitationDialog,
+    setShowCodeBlockDialog,
+    setShowKeyboardShortcuts,
     darkMode, setDarkMode,
     wordCount,
-    zenMode, setZenMode,
     pasteAsPlainText, setPasteAsPlainText,
     uiLanguage,
     isRibbonCollapsed, setIsRibbonCollapsed,
-    showFocusMode, setShowFocusMode,
-    typewriterMode, setTypewriterMode,
-    wordGoal, setWordGoal,
-    selectionContext,
-    editorRef,
+    setShowFocusMode,
     isMobile,
-    toast,
+    docsLoaded,
+    handleSaveNow,
 
     handleNewDoc,
     handleRemoveFromHistory,
-    handleTemplateSelect,
-    handleImportDocument,
     handleOpenDoc,
     handleContentChange,
     handleTitleChange,
@@ -71,7 +71,6 @@ const MainLayout: React.FC = () => {
     executeCommand,
     handleTableAction,
     handleImageAction,
-    handleContextChange,
     handleOpenLinkDialog,
     handleCreateCommentFromSelection,
     handleToggleTracking,
@@ -79,10 +78,16 @@ const MainLayout: React.FC = () => {
     handleToggleMarkdown
   } = useApp();
 
+  if (!docsLoaded) {
+    return <div className={`h-screen w-full ${darkMode ? 'bg-[#0f0f0f]' : 'bg-[#f8fafc]'}`} />;
+  }
+
   if (isMobile) {
     return (
       <div className={`h-screen w-full overflow-hidden ${darkMode ? 'bg-zinc-950 text-gray-100' : 'bg-gray-100 text-gray-900'}`}>
-        <MobileChatEditor />
+        <React.Suspense fallback={null}>
+          <MobileChatEditor />
+        </React.Suspense>
         <PenkoAssistant />
         <DialogsContainer />
       </div>
@@ -92,7 +97,7 @@ const MainLayout: React.FC = () => {
   return (
     <div className={`flex h-screen w-full overflow-hidden text-sm transition-colors duration-200 ${darkMode ? 'bg-[#0f0f0f] text-gray-200' : 'bg-[#f8fafc] text-gray-900'}`}>
       
-      {!zenMode && (
+      {(
         <Sidebar
           isOpen={isSidebarOpen}
           setIsOpen={setIsSidebarOpen}
@@ -102,12 +107,7 @@ const MainLayout: React.FC = () => {
           onNewDoc={handleNewDoc}
           onNewFromTemplate={() => setShowTemplates(true)}
           onImportDoc={() => setShowImportDialog(true)}
-          onSave={() => {
-            if (currentDoc) {
-              saveToStorage(currentDoc);
-              toast.success('Document saved!');
-            }
-          }}
+          onSave={() => void handleSaveNow()}
           darkMode={darkMode}
           toggleDarkMode={() => setDarkMode(!darkMode)}
           onShowHistory={() => setShowHistory(true)}
@@ -121,48 +121,38 @@ const MainLayout: React.FC = () => {
 
       <div className="flex-1 flex flex-row relative h-full overflow-hidden">
         <div 
-          className={`flex-1 overflow-auto flex flex-col items-center relative transition-all duration-300 ${zenMode ? 'pt-10' : ''}`}
+          id="editor-scroll-container"
+          className="flex-1 overflow-auto flex flex-col items-center [align-items:safe_center] relative transition-all duration-300"
           onClick={() => setIsSidebarOpen(false)}
         >
-           {!zenMode && showRuler && (
+           {showRuler && (
               <div className="sticky top-0 z-20 mt-2 mb-4 drop-shadow-sm">
                  <Ruler darkMode={darkMode} />
               </div>
            )}
            
-           <div className={`flex-1 flex justify-center w-full px-4 pb-32 transition-transform duration-300 ${zenMode ? 'scale-105' : ''}`}>
+           <div className="flex-1 flex justify-center [justify-content:safe_center] w-full px-4 pb-32 transition-transform duration-300">
               {currentDoc?.isMarkdownMode ? (
+                <React.Suspense fallback={null}>
                 <MarkdownEditor
+                  key={`${currentDoc.id}:${contentRevision}`}
                   content={currentDoc?.content || ''}
+                  markdownSource={currentDoc?.markdownSource}
                   onChange={handleContentChange}
                   darkMode={darkMode}
                   language={currentDoc?.language || 'en-US'}
                 />
-              ) : (
-                <Editor
-                  content={currentDoc?.content || ''}
-                  onChange={handleContentChange}
-                  zoom={zoom}
-                  pageConfig={currentDoc?.pageConfig}
-                  darkMode={darkMode}
-                  ref={editorRef}
-                  pasteAsPlainText={pasteAsPlainText}
-                  language={currentDoc?.language || 'en-US'}
-                  onContextChange={handleContextChange}
-                  header={currentDoc?.header}
-                  footer={currentDoc?.footer}
-                  showPageNumbers={currentDoc?.showPageNumbers}
-                  pageNumberPosition={currentDoc?.pageNumberPosition}
-                  isScreenplay={currentDoc?.isScreenplay}
-                />
-              )}
+                </React.Suspense>
+              ) : currentDoc ? (
+                <Editor key={currentDoc.id} doc={currentDoc} />
+              ) : null}
            </div>
         </div>
 
         {/* Right Columns formatting blades */}
-        {!zenMode && !isMobile && (
+        {!isMobile && (
           <div className="z-30 shrink-0 h-full flex">
-             <Ribbon
+             <SelectionAwareRibbon
               onCommand={executeCommand}
               currentDoc={currentDoc}
               onTitleChange={handleTitleChange}
@@ -175,12 +165,10 @@ const MainLayout: React.FC = () => {
               togglePasteAsPlainText={() => setPasteAsPlainText(!pasteAsPlainText)}
               onShowStats={() => setShowStats(true)}
               onToggleZenMode={() => setShowFocusMode(true)}
-              onToggleFocusMode={() => setShowFocusMode(true)}
-              selectionContext={selectionContext}
               onTableAction={handleTableAction}
               onImageAction={handleImageAction}
               onPresent={() => setShowPresentation(true)}
-              onShowHeaderFooter={() => setShowHeaderFooter(true)}
+              onShowHeaderFooter={() => openHeaderFooter()}
               onShowLinkDialog={handleOpenLinkDialog}
               onShowCommentsPanel={() => setShowCommentsPanel(true)}
               onCreateComment={handleCreateCommentFromSelection}
@@ -209,7 +197,7 @@ const MainLayout: React.FC = () => {
           </div>
         )}
 
-        {!zenMode && (
+        {(
           <div className="absolute bottom-6 left-1/2 transform -translate-x-1/2 z-40">
              <StatusBar 
                wordCount={wordCount} 
@@ -220,37 +208,16 @@ const MainLayout: React.FC = () => {
                language={currentDoc?.language || 'en-US'}
                onChangeLanguage={handleLanguageChange}
                uiLanguage={uiLanguage}
+               pageInfo={currentDoc && !currentDoc.isMarkdownMode && (currentDoc.pageConfig?.cols || 1) === 1 ? pageInfo : undefined}
              />
           </div>
         )}
 
-        {zenMode && (
-           <button 
-             onClick={() => setZenMode(false)}
-             className="fixed bottom-8 right-8 bg-black/50 hover:bg-black/80 text-white p-3 rounded-full backdrop-blur transition-all shadow-lg z-50 group flex items-center gap-2"
-           >
-              <Minimize2 size={24} />
-              <span className="max-w-0 overflow-hidden group-hover:max-w-xs transition-all duration-300 whitespace-nowrap text-sm font-medium">Exit Focus</span>
-           </button>
-        )}
         <PenkoAssistant />
       </div>
 
       <DialogsContainer />
 
-      {showFocusMode && (
-        <FocusMode
-          content={currentDoc?.content || ''}
-          onChange={handleContentChange}
-          onExit={() => setShowFocusMode(false)}
-          darkMode={darkMode}
-          uiLanguage={uiLanguage}
-          typewriterMode={typewriterMode}
-          onToggleTypewriter={() => setTypewriterMode(!typewriterMode)}
-          wordGoal={wordGoal}
-          onSetWordGoal={setWordGoal}
-        />
-      )}
     </div>
   );
 };
@@ -258,7 +225,9 @@ const MainLayout: React.FC = () => {
 const App: React.FC = () => {
   return (
     <AppProvider>
-      <MainLayout />
+      <FilesProvider>
+        <MainLayout />
+      </FilesProvider>
     </AppProvider>
   );
 };

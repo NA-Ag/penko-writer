@@ -1,7 +1,16 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import { ToastMessage, ToastType } from '../components/Toast';
 
 let toastIdCounter = 0;
+/** At most this many toasts are visible; older ones are dropped first. */
+export const MAX_TOASTS = 5;
+
+/**
+ * Add a toast to the stack. An identical message that is still showing is
+ * replaced (its timer restarts) instead of stacking up.
+ */
+export const pushToast = (list: ToastMessage[], toast: ToastMessage, max = MAX_TOASTS): ToastMessage[] =>
+  [...list.filter(t => t.message !== toast.message || t.type !== toast.type), toast].slice(-max);
 
 export const useToast = () => {
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
@@ -15,7 +24,7 @@ export const useToast = () => {
       duration,
     };
 
-    setToasts((prev) => [...prev, newToast]);
+    setToasts((prev) => pushToast(prev, newToast));
     return id;
   }, []);
 
@@ -39,13 +48,8 @@ export const useToast = () => {
     setToasts((prev) => prev.filter((toast) => toast.id !== id));
   }, []);
 
-  return {
-    toasts,
-    showToast,
-    success,
-    error,
-    info,
-    warning,
-    closeToast,
-  };
+  return useMemo(
+    () => ({ toasts, showToast, success, error, info, warning, closeToast }),
+    [toasts, showToast, success, error, info, warning, closeToast],
+  );
 };

@@ -1,6 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { X, Square, Circle, Diamond, ArrowRight, Type, Download, Trash2, Move } from 'lucide-react';
+import { X, Square, Circle, Diamond, ArrowRight, Download, Trash2, Move, FilePlus } from 'lucide-react';
 import { t, LanguageCode } from '../utils/translations';
+import { useFocusTrap } from '../utils/hooks';
+import { useApp } from '../AppContext';
+import { connectorEndpoints } from '../utils/diagram';
 
 type ShapeType = 'rectangle' | 'circle' | 'diamond';
 
@@ -26,7 +29,8 @@ interface DiagramEditorProps {
   onClose: () => void;
   darkMode: boolean;
   uiLanguage: LanguageCode;
-  onInsert?: (svgContent: string) => void;
+  /** Receives a PNG data URL of the diagram. */
+  onInsert?: (dataUrl: string) => void;
 }
 
 export const DiagramEditor: React.FC<DiagramEditorProps> = ({
@@ -37,6 +41,10 @@ export const DiagramEditor: React.FC<DiagramEditorProps> = ({
   onInsert
 }) => {
   const canvasRef = useRef<SVGSVGElement>(null);
+  const dialogRef = useFocusTrap<HTMLDivElement>(isOpen);
+  const { toast } = useApp();
+  const [isInserting, setIsInserting] = useState(false);
+  const nextId = useRef(0);
   const [shapes, setShapes] = useState<Shape[]>([]);
   const [connectors, setConnectors] = useState<Connector[]>([]);
   const [selectedTool, setSelectedTool] = useState<ShapeType | 'arrow' | 'select'>('select');
@@ -44,11 +52,77 @@ export const DiagramEditor: React.FC<DiagramEditorProps> = ({
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [connectingFrom, setConnectingFrom] = useState<string | null>(null);
+  const newId = (prefix: string) => `${prefix}-${Date.now()}-${nextId.current++}`;
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT') return; // let the text field handle it first
+      e.preventDefault();
+      onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [isOpen, onClose]);
+
+  /** Serialise the canvas without selection highlighting. */
+  const serializeSvg = (): string | null => {
+    if (!canvasRef.current) return null;
+    const clone = canvasRef.current.cloneNode(true) as SVGSVGElement;
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    clone.removeAttribute('class');
+    clone.querySelectorAll('[stroke="#ef4444"]').forEach(el => {
+      el.setAttribute('stroke', '#6b7280');
+      el.setAttribute('stroke-width', '1');
+    });
+    return new XMLSerializer().serializeToString(clone);
+  };
+
+  /** Render the diagram to a PNG data URL (white background, 2x for sharpness). */
+  const renderPng = (background: string): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const svgData = serializeSvg();
+      if (!svgData) return reject(new Error('no canvas'));
+      const scale = 2;
+      const canvas = document.createElement('canvas');
+      canvas.width = 800 * scale;
+      canvas.height = 600 * scale;
+      const ctx = canvas.getContext('2d');
+      const img = new Image();
+      img.onload = () => {
+        if (!ctx) return reject(new Error('no context'));
+        ctx.fillStyle = background;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/png'));
+      };
+      img.onerror = () => reject(new Error('render failed'));
+      img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgData)));
+    });
+
+  const handleInsertIntoDocument = async () => {
+    if (!onInsert || shapes.length === 0) return;
+    setIsInserting(true);
+    try {
+      const dataUrl = await renderPng('#ffffff');
+      onInsert(dataUrl);
+      setShapes([]);
+      setConnectors([]);
+      setSelectedShape(null);
+      setConnectingFrom(null);
+    } catch {
+      toast.error(t(uiLanguage, 'exportFailed'));
+    } finally {
+      setIsInserting(false);
+    }
+  };
 
   // Add shape to canvas
   const addShape = (x: number, y: number, type: ShapeType) => {
     const newShape: Shape = {
-      id: `shape-${Date.now()}`,
+      id: newId('shape'),
       type,
       x,
       y,
@@ -84,7 +158,7 @@ export const DiagramEditor: React.FC<DiagramEditorProps> = ({
         setConnectingFrom(shapeId);
       } else if (connectingFrom !== shapeId) {
         const newConnector: Connector = {
-          id: `connector-${Date.now()}`,
+          id: newId('connector'),
           from: connectingFrom,
           to: shapeId
         };
@@ -141,8 +215,8 @@ export const DiagramEditor: React.FC<DiagramEditorProps> = ({
 
   // Export to SVG
   const exportToSVG = () => {
-    if (!canvasRef.current) return;
-    const svgContent = canvasRef.current.outerHTML;
+    const svgContent = serializeSvg();
+    if (!svgContent) return;
     const blob = new Blob([svgContent], { type: 'image/svg+xml' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -153,41 +227,22 @@ export const DiagramEditor: React.FC<DiagramEditorProps> = ({
   };
 
   // Export to PNG
-  const exportToPNG = () => {
-    if (!canvasRef.current) return;
-
-    const svgData = new XMLSerializer().serializeToString(canvasRef.current);
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-    const img = new Image();
-
-    canvas.width = 800;
-    canvas.height = 600;
-
-    img.onload = () => {
-      if (ctx) {
-        ctx.fillStyle = darkMode ? '#1e1e1e' : '#ffffff';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(img, 0, 0);
-        canvas.toBlob((blob) => {
-          if (blob) {
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = 'diagram.png';
-            link.click();
-            URL.revokeObjectURL(url);
-          }
-        });
-      }
-    };
-
-    img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgData)));
+  const exportToPNG = async () => {
+    try {
+      const dataUrl = await renderPng(darkMode ? '#1e1e1e' : '#ffffff');
+      const link = document.createElement('a');
+      link.href = dataUrl;
+      link.download = 'diagram.png';
+      link.click();
+    } catch {
+      toast.error(t(uiLanguage, 'exportFailed'));
+    }
   };
 
   // Render shape
   const renderShape = (shape: Shape) => {
-    const isSelected = selectedShape === shape.id;
+    // The first shape of a connector being drawn is highlighted like a selection
+    const isSelected = selectedShape === shape.id || connectingFrom === shape.id;
     const strokeColor = isSelected ? '#ef4444' : '#6b7280';
 
     switch (shape.type) {
@@ -288,10 +343,8 @@ export const DiagramEditor: React.FC<DiagramEditorProps> = ({
 
     if (!fromShape || !toShape) return null;
 
-    const x1 = fromShape.x + fromShape.width / 2;
-    const y1 = fromShape.y + fromShape.height / 2;
-    const x2 = toShape.x + toShape.width / 2;
-    const y2 = toShape.y + toShape.height / 2;
+    // Edge to edge, so the arrowhead is not hidden under the target shape
+    const { x1, y1, x2, y2 } = connectorEndpoints(fromShape, toShape);
 
     return (
       <g key={connector.id}>
@@ -314,12 +367,12 @@ export const DiagramEditor: React.FC<DiagramEditorProps> = ({
   const toolBg = darkMode ? 'bg-[#2a2a2a]' : 'bg-gray-50';
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-sm">
-      <div className={`w-[90vw] h-[90vh] rounded-lg shadow-2xl border flex flex-col ${bg}`}>
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="diagram-editor-title">
+      <div ref={dialogRef} className={`w-[90vw] h-[90vh] rounded-lg shadow-2xl border flex flex-col ${bg}`}>
         {/* Header */}
         <div className={`p-4 border-b flex justify-between items-center ${darkMode ? 'border-gray-700' : 'border-gray-200'}`}>
-          <h2 className="text-lg font-bold">{t(uiLanguage, 'diagramEditor')}</h2>
-          <button onClick={onClose} className="opacity-60 hover:opacity-100">
+          <h2 id="diagram-editor-title" className="text-lg font-bold">{t(uiLanguage, 'diagramEditor')}</h2>
+          <button onClick={onClose} className="opacity-60 hover:opacity-100" aria-label={t(uiLanguage, 'close')}>
             <X size={20} />
           </button>
         </div>
@@ -330,35 +383,45 @@ export const DiagramEditor: React.FC<DiagramEditorProps> = ({
             <button
               onClick={() => setSelectedTool('select')}
               className={`p-2 rounded ${selectedTool === 'select' ? 'bg-blue-600 text-white' : 'hover:bg-gray-200 dark:hover:bg-gray-700'}`}
-              title="Select"
+              title={t(uiLanguage, 'toolSelect')}
+              aria-label={t(uiLanguage, 'toolSelect')}
+              aria-pressed={selectedTool === 'select'}
             >
               <Move size={20} />
             </button>
             <button
               onClick={() => setSelectedTool('rectangle')}
               className={`p-2 rounded ${selectedTool === 'rectangle' ? 'bg-blue-600 text-white' : 'hover:bg-gray-200 dark:hover:bg-gray-700'}`}
-              title="Rectangle"
+              title={t(uiLanguage, 'toolRectangle')}
+              aria-label={t(uiLanguage, 'toolRectangle')}
+              aria-pressed={selectedTool === 'rectangle'}
             >
               <Square size={20} />
             </button>
             <button
               onClick={() => setSelectedTool('circle')}
               className={`p-2 rounded ${selectedTool === 'circle' ? 'bg-blue-600 text-white' : 'hover:bg-gray-200 dark:hover:bg-gray-700'}`}
-              title="Circle"
+              title={t(uiLanguage, 'toolCircle')}
+              aria-label={t(uiLanguage, 'toolCircle')}
+              aria-pressed={selectedTool === 'circle'}
             >
               <Circle size={20} />
             </button>
             <button
               onClick={() => setSelectedTool('diamond')}
               className={`p-2 rounded ${selectedTool === 'diamond' ? 'bg-blue-600 text-white' : 'hover:bg-gray-200 dark:hover:bg-gray-700'}`}
-              title="Diamond"
+              title={t(uiLanguage, 'toolDiamond')}
+              aria-label={t(uiLanguage, 'toolDiamond')}
+              aria-pressed={selectedTool === 'diamond'}
             >
               <Diamond size={20} />
             </button>
             <button
               onClick={() => { setSelectedTool('arrow'); setConnectingFrom(null); }}
               className={`p-2 rounded ${selectedTool === 'arrow' ? 'bg-blue-600 text-white' : 'hover:bg-gray-200 dark:hover:bg-gray-700'}`}
-              title="Arrow"
+              title={t(uiLanguage, 'toolArrow')}
+              aria-label={t(uiLanguage, 'toolArrow')}
+              aria-pressed={selectedTool === 'arrow'}
             >
               <ArrowRight size={20} />
             </button>
@@ -367,7 +430,8 @@ export const DiagramEditor: React.FC<DiagramEditorProps> = ({
               onClick={deleteShape}
               disabled={!selectedShape}
               className="p-2 rounded hover:bg-red-600 hover:text-white disabled:opacity-30"
-              title="Delete"
+              title={t(uiLanguage, 'delete')}
+              aria-label={t(uiLanguage, 'delete')}
             >
               <Trash2 size={20} />
             </button>
@@ -377,6 +441,8 @@ export const DiagramEditor: React.FC<DiagramEditorProps> = ({
           <div className="flex-1 overflow-auto p-4">
             <svg
               ref={canvasRef}
+              role="img"
+              aria-label={t(uiLanguage, 'diagramCanvas')}
               width="800"
               height="600"
               className={`border rounded ${darkMode ? 'border-gray-700 bg-[#2a2a2a]' : 'border-gray-300 bg-white'}`}
@@ -409,18 +475,20 @@ export const DiagramEditor: React.FC<DiagramEditorProps> = ({
               <h3 className="font-bold mb-4">{t(uiLanguage, 'properties')}</h3>
               <div className="space-y-3">
                 <div>
-                  <label className="text-xs opacity-60 block mb-1">{t(uiLanguage, 'text')}</label>
+                  <label htmlFor="diagram-shape-text" className="text-xs opacity-60 block mb-1">{t(uiLanguage, 'text')}</label>
                   <input
+                    id="diagram-shape-text"
                     type="text"
                     value={shapes.find(s => s.id === selectedShape)?.text || ''}
                     onChange={(e) => updateShapeText(selectedShape, e.target.value)}
                     className={`w-full px-2 py-1 text-sm rounded border ${darkMode ? 'bg-[#1e1e1e] border-gray-600' : 'bg-white border-gray-300'}`}
-                    placeholder="Enter text..."
+                    placeholder={t(uiLanguage, 'enterTextPlaceholder')}
                   />
                 </div>
                 <div>
-                  <label className="text-xs opacity-60 block mb-1">{t(uiLanguage, 'color')}</label>
+                  <label htmlFor="diagram-shape-color" className="text-xs opacity-60 block mb-1">{t(uiLanguage, 'color')}</label>
                   <input
+                    id="diagram-shape-color"
                     type="color"
                     value={shapes.find(s => s.id === selectedShape)?.color || '#3b82f6'}
                     onChange={(e) => setShapes(shapes.map(s => s.id === selectedShape ? { ...s, color: e.target.value } : s))}
@@ -450,6 +518,15 @@ export const DiagramEditor: React.FC<DiagramEditorProps> = ({
             >
               <Download size={14} /> PNG
             </button>
+            {onInsert && (
+              <button
+                onClick={handleInsertIntoDocument}
+                disabled={shapes.length === 0 || isInserting}
+                className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <FilePlus size={14} /> {t(uiLanguage, 'insertIntoDocument')}
+              </button>
+            )}
           </div>
         </div>
       </div>

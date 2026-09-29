@@ -1,0 +1,15 @@
+/** Base64 <-> bytes without Node's Buffer (browser + jsdom). */
+
+export const base64ToBytes = (b64: string): Uint8Array => {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+};
+
+export const bytesToBase64 = (bytes: Uint8Array): string => {
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+  return btoa(bin);
+};

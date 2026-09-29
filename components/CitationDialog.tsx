@@ -1,20 +1,15 @@
 import React, { useState, useEffect } from 'react';
-import { X, Check, BookMarked, Plus, Trash2, FileText } from 'lucide-react';
+import { X, Check, BookMarked, Plus, Trash2, FileText, Pencil } from 'lucide-react';
+import { NodeSelection } from '@tiptap/pm/state';
 import { t, LanguageCode } from '../utils/translations';
+import { useApp } from '../AppContext';
+import { useFocusTrap } from '../utils/hooks';
+import { Citation } from '../types';
+import { CitationStyle, formatBibliographyEntry } from '../editor/citations';
+import { sanitizeHtml } from '../editor/sanitize';
 
-interface Citation {
-  id: string;
-  type: 'book' | 'journal' | 'website' | 'article';
-  author: string;
-  title: string;
-  year: string;
-  publisher?: string;
-  journal?: string;
-  volume?: string;
-  pages?: string;
-  url?: string;
-  accessDate?: string;
-}
+/** Same text as the bibliography entry in the document (escaped HTML with <i>). */
+const previewHtml = (citation: Citation, style: CitationStyle) => ({ __html: sanitizeHtml(formatBibliographyEntry(citation, style)) });
 
 interface CitationDialogProps {
   isOpen: boolean;
@@ -28,8 +23,6 @@ interface CitationDialogProps {
   uiLanguage: LanguageCode;
 }
 
-type CitationStyle = 'apa' | 'mla' | 'chicago' | 'bibtex';
-
 const CitationDialog: React.FC<CitationDialogProps> = ({
   isOpen,
   onClose,
@@ -41,9 +34,14 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
   onDeleteCitation,
   uiLanguage,
 }) => {
+  const { handleUpdateCitation, toast, editor } = useApp();
+  const dialogRef = useFocusTrap<HTMLDivElement>(isOpen);
   const [mode, setMode] = useState<'insert' | 'add' | 'bibliography'>('insert');
   const [style, setStyle] = useState<CitationStyle>('apa');
   const [selectedCitation, setSelectedCitation] = useState<string>('');
+  const [editingId, setEditingId] = useState<string | null>(null);
+  // Position of a citation selected in the document: "Insert" then updates it in place
+  const [citationPos, setCitationPos] = useState<number | null>(null);
 
   // New citation form
   const [citationType, setCitationType] = useState<'book' | 'journal' | 'website' | 'article'>('book');
@@ -60,11 +58,63 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
   useEffect(() => {
     if (!isOpen) {
       setMode('insert');
+      setCitationPos(null);
       resetForm();
+      return;
     }
+    const sel = editor && !editor.isDestroyed ? editor.state.selection : null;
+    if (sel instanceof NodeSelection && sel.node.type.name === 'citation') {
+      setCitationPos(sel.from);
+      setSelectedCitation(sel.node.attrs.citationId || '');
+      setStyle((sel.node.attrs.citationStyle as CitationStyle) || 'apa');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
+  // Never keep a selection pointing at a deleted source
+  useEffect(() => {
+    if (selectedCitation && !existingCitations.some(c => c.id === selectedCitation)) setSelectedCitation('');
+    if (editingId && !existingCitations.some(c => c.id === editingId)) {
+      setEditingId(null);
+      resetForm();
+    }
+  }, [existingCitations, selectedCitation, editingId]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [isOpen, onClose]);
+
+  const startEdit = (citation: Citation) => {
+    setEditingId(citation.id);
+    setCitationType(citation.type);
+    setAuthor(citation.author || '');
+    setTitle(citation.title || '');
+    setYear(citation.year || '');
+    setPublisher(citation.publisher || '');
+    setJournal(citation.journal || '');
+    setVolume(citation.volume || '');
+    setPages(citation.pages || '');
+    setUrl(citation.url || '');
+    setAccessDate(citation.accessDate || '');
+    setMode('add');
+  };
+
+  const handleDelete = (id: string) => {
+    onDeleteCitation(id);
+    if (selectedCitation === id) setSelectedCitation('');
+    if (editingId === id) resetForm();
+  };
+
   const resetForm = () => {
+    setEditingId(null);
     setCitationType('book');
     setAuthor('');
     setTitle('');
@@ -78,13 +128,13 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
   };
 
   const handleAddCitation = () => {
-    if (!author || !title || !year) {
-      alert(t(uiLanguage, 'fillRequiredFields'));
+    if (!author.trim() || !title.trim() || !year.trim()) {
+      toast.warning(t(uiLanguage, 'fillRequiredFields'));
       return;
     }
 
     const newCitation: Citation = {
-      id: crypto.randomUUID(),
+      id: editingId || (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `cit-${Date.now()}-${Math.random().toString(36).slice(2)}`),
       type: citationType,
       author,
       title,
@@ -97,16 +147,29 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
       accessDate,
     };
 
-    onAddCitation(newCitation);
+    if (editingId) handleUpdateCitation(newCitation);
+    else onAddCitation(newCitation);
+    setSelectedCitation(newCitation.id);
     resetForm();
     setMode('insert');
   };
 
   const handleInsertCitation = () => {
-    if (selectedCitation) {
+    if (!selectedCitation) return;
+    const node = citationPos !== null && editor && !editor.isDestroyed ? editor.state.doc.nodeAt(citationPos) : null;
+    if (node?.type.name === 'citation' && editor) {
+      editor
+        .chain()
+        .focus()
+        .command(({ tr }) => {
+          tr.setNodeMarkup(citationPos!, undefined, { ...node.attrs, citationId: selectedCitation, citationStyle: style });
+          return true;
+        })
+        .run();
+    } else {
       onInsertCitation(selectedCitation, style);
-      onClose();
     }
+    onClose();
   };
 
   const handleInsertBibliography = () => {
@@ -114,48 +177,11 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
     onClose();
   };
 
-  const formatPreview = (citation: Citation, previewStyle: CitationStyle): string => {
-    const { author, title, year, publisher, journal, volume, pages } = citation;
-
-    switch (previewStyle) {
-      case 'apa':
-        if (citation.type === 'book') {
-          return `${author} (${year}). ${title}. ${publisher || 'Publisher'}.`;
-        } else if (citation.type === 'journal') {
-          return `${author} (${year}). ${title}. ${journal}, ${volume}${pages ? `, ${pages}` : ''}.`;
-        }
-        return `${author} (${year}). ${title}.`;
-
-      case 'mla':
-        if (citation.type === 'book') {
-          return `${author}. ${title}. ${publisher || 'Publisher'}, ${year}.`;
-        } else if (citation.type === 'journal') {
-          return `${author}. "${title}." ${journal} ${volume} (${year})${pages ? `: ${pages}` : ''}.`;
-        }
-        return `${author}. ${title}. ${year}.`;
-
-      case 'chicago':
-        if (citation.type === 'book') {
-          return `${author}. ${title}. ${publisher ? `${publisher}, ` : ''}${year}.`;
-        } else if (citation.type === 'journal') {
-          return `${author}. "${title}." ${journal} ${volume}${pages ? ` (${year}): ${pages}` : ` (${year})`}.`;
-        }
-        return `${author}. ${title}. ${year}.`;
-
-      case 'bibtex':
-        const bibType = citation.type === 'journal' ? 'article' : citation.type;
-        return `@${bibType}{${author.split(' ')[0].toLowerCase()}${year},\n  author = {${author}},\n  title = {${title}},\n  year = {${year}}\n}`;
-
-      default:
-        return `${author} (${year}). ${title}.`;
-    }
-  };
-
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 backdrop-blur-sm p-4">
-      <div className={`
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 backdrop-blur-sm p-4" role="dialog" aria-modal="true" aria-labelledby="citation-dialog-title">
+      <div ref={dialogRef} className={`
         max-w-4xl w-full rounded-2xl shadow-2xl overflow-hidden max-h-[90vh] flex flex-col
         ${darkMode ? 'bg-[#1e1e1e]' : 'bg-white'}
       `}>
@@ -163,6 +189,7 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
         <div className="bg-gradient-to-r from-orange-600 to-red-600 p-6 text-white relative flex-shrink-0">
           <button
             onClick={onClose}
+            aria-label={t(uiLanguage, 'close')}
             className="absolute top-4 right-4 text-white/80 hover:text-white transition-colors"
           >
             <X className="w-6 h-6" />
@@ -173,7 +200,7 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
               <BookMarked className="w-6 h-6" />
             </div>
             <div>
-              <h2 className="text-xl font-bold">{t(uiLanguage, 'citationsAndBibliography')}</h2>
+              <h2 id="citation-dialog-title" className="text-xl font-bold">{t(uiLanguage, 'citationsAndBibliography')}</h2>
               <p className="text-orange-100 text-sm">{t(uiLanguage, 'manageReferences')}</p>
             </div>
           </div>
@@ -182,7 +209,7 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
         {/* Mode Tabs */}
         <div className={`flex border-b ${darkMode ? 'border-gray-800' : 'border-gray-200'}`}>
           <button
-            onClick={() => setMode('insert')}
+            onClick={() => { setMode('insert'); if (editingId) resetForm(); }}
             className={`flex-1 px-4 py-3 font-medium transition-colors ${
               mode === 'insert'
                 ? darkMode
@@ -207,10 +234,10 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                 : 'text-gray-600 hover:bg-gray-50'
             }`}
           >
-            {t(uiLanguage, 'addNewSource')}
+            {editingId ? t(uiLanguage, 'editSource') : t(uiLanguage, 'addNewSource')}
           </button>
           <button
-            onClick={() => setMode('bibliography')}
+            onClick={() => { setMode('bibliography'); if (editingId) resetForm(); }}
             className={`flex-1 px-4 py-3 font-medium transition-colors ${
               mode === 'bibliography'
                 ? darkMode
@@ -272,7 +299,16 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                   {existingCitations.map((citation) => (
                     <div
                       key={citation.id}
+                      role="button"
+                      tabIndex={0}
+                      aria-pressed={selectedCitation === citation.id}
                       onClick={() => setSelectedCitation(citation.id)}
+                      onKeyDown={(e) => {
+                        if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) {
+                          e.preventDefault();
+                          setSelectedCitation(citation.id);
+                        }
+                      }}
                       className={`
                         p-4 rounded-lg cursor-pointer transition-all border-2
                         ${selectedCitation === citation.id
@@ -293,16 +329,31 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                           <p className={`text-sm mb-2 ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
                             {citation.title}
                           </p>
-                          <p className={`text-xs font-mono ${darkMode ? 'text-gray-500' : 'text-gray-500'}`}>
-                            {formatPreview(citation, style)}
-                          </p>
+                          <p className="text-xs font-mono text-gray-500" dangerouslySetInnerHTML={previewHtml(citation, style)} />
                         </div>
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            onDeleteCitation(citation.id);
+                            startEdit(citation);
                           }}
+                          aria-label={t(uiLanguage, 'editSource')}
+                          title={t(uiLanguage, 'editSource')}
                           className={`ml-4 p-2 rounded transition-colors ${
+                            darkMode
+                              ? 'hover:bg-gray-700 text-gray-400'
+                              : 'hover:bg-gray-200 text-gray-600'
+                          }`}
+                        >
+                          <Pencil className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDelete(citation.id);
+                          }}
+                          aria-label={t(uiLanguage, 'delete')}
+                          title={t(uiLanguage, 'delete')}
+                          className={`ml-1 p-2 rounded transition-colors ${
                             darkMode
                               ? 'hover:bg-red-900/30 text-red-400'
                               : 'hover:bg-red-100 text-red-600'
@@ -322,7 +373,7 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
           {mode === 'add' && (
             <div>
               <h3 className={`text-lg font-semibold mb-4 ${darkMode ? 'text-gray-200' : 'text-gray-800'}`}>
-                {t(uiLanguage, 'addNewSource')}
+                {editingId ? t(uiLanguage, 'editSource') : t(uiLanguage, 'addNewSource')}
               </h3>
 
               {/* Source Type */}
@@ -345,7 +396,7 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                         }
                       `}
                     >
-                      {type}
+                      {t(uiLanguage, type)}
                     </button>
                   ))}
                 </div>
@@ -354,14 +405,15 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
               {/* Form Fields */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                  <label htmlFor="citation-author" className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
                     {t(uiLanguage, 'authors')} *
                   </label>
                   <input
+                    id="citation-author"
                     type="text"
                     value={author}
                     onChange={(e) => setAuthor(e.target.value)}
-                    placeholder="Last, First"
+                    placeholder={t(uiLanguage, 'phAuthor')}
                     className={`w-full px-3 py-2 rounded-lg ${
                       darkMode
                         ? 'bg-gray-800 text-white border-gray-700'
@@ -371,10 +423,11 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                 </div>
 
                 <div>
-                  <label className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                  <label htmlFor="citation-year" className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
                     {t(uiLanguage, 'year')} *
                   </label>
                   <input
+                    id="citation-year"
                     type="text"
                     value={year}
                     onChange={(e) => setYear(e.target.value)}
@@ -388,14 +441,15 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                 </div>
 
                 <div className="md:col-span-2">
-                  <label className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                  <label htmlFor="citation-title" className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
                     {t(uiLanguage, 'title')} *
                   </label>
                   <input
+                    id="citation-title"
                     type="text"
                     value={title}
                     onChange={(e) => setTitle(e.target.value)}
-                    placeholder="Title of the work"
+                    placeholder={t(uiLanguage, 'phTitle')}
                     className={`w-full px-3 py-2 rounded-lg ${
                       darkMode
                         ? 'bg-gray-800 text-white border-gray-700'
@@ -406,14 +460,15 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
 
                 {(citationType === 'book' || citationType === 'article') && (
                   <div className="md:col-span-2">
-                    <label className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
-                      Publisher
+                    <label htmlFor="citation-publisher" className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                      {t(uiLanguage, 'publisher')}
                     </label>
                     <input
+                    id="citation-publisher"
                       type="text"
                       value={publisher}
                       onChange={(e) => setPublisher(e.target.value)}
-                      placeholder="Publisher name"
+                      placeholder={t(uiLanguage, 'phPublisher')}
                       className={`w-full px-3 py-2 rounded-lg ${
                         darkMode
                           ? 'bg-gray-800 text-white border-gray-700'
@@ -426,14 +481,15 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                 {citationType === 'journal' && (
                   <>
                     <div>
-                      <label className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
-                        Journal
+                      <label htmlFor="citation-journal" className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                        {t(uiLanguage, 'journal')}
                       </label>
                       <input
+                    id="citation-journal"
                         type="text"
                         value={journal}
                         onChange={(e) => setJournal(e.target.value)}
-                        placeholder="Journal name"
+                        placeholder={t(uiLanguage, 'phJournal')}
                         className={`w-full px-3 py-2 rounded-lg ${
                           darkMode
                             ? 'bg-gray-800 text-white border-gray-700'
@@ -443,10 +499,11 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                     </div>
 
                     <div>
-                      <label className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
-                        Volume
+                      <label htmlFor="citation-volume" className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                        {t(uiLanguage, 'volume')}
                       </label>
                       <input
+                    id="citation-volume"
                         type="text"
                         value={volume}
                         onChange={(e) => setVolume(e.target.value)}
@@ -460,10 +517,11 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                     </div>
 
                     <div className="md:col-span-2">
-                      <label className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
-                        Pages
+                      <label htmlFor="citation-pages" className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                        {t(uiLanguage, 'pages')}
                       </label>
                       <input
+                    id="citation-pages"
                         type="text"
                         value={pages}
                         onChange={(e) => setPages(e.target.value)}
@@ -481,10 +539,11 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                 {citationType === 'website' && (
                   <>
                     <div className="md:col-span-2">
-                      <label className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
-                        URL
+                      <label htmlFor="citation-url" className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                        {t(uiLanguage, 'url')}
                       </label>
                       <input
+                    id="citation-url"
                         type="url"
                         value={url}
                         onChange={(e) => setUrl(e.target.value)}
@@ -498,14 +557,15 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                     </div>
 
                     <div className="md:col-span-2">
-                      <label className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
-                        Access Date
+                      <label htmlFor="citation-access-date" className={`block text-sm font-medium mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                        {t(uiLanguage, 'accessDate')}
                       </label>
                       <input
+                    id="citation-access-date"
                         type="text"
                         value={accessDate}
                         onChange={(e) => setAccessDate(e.target.value)}
-                        placeholder="January 15, 2024"
+                        placeholder={t(uiLanguage, 'phAccessDate')}
                         className={`w-full px-3 py-2 rounded-lg ${
                           darkMode
                             ? 'bg-gray-800 text-white border-gray-700'
@@ -539,9 +599,7 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                   </h4>
                   <div className="space-y-2 text-sm font-mono">
                     {existingCitations.map((citation) => (
-                      <div key={citation.id} className={darkMode ? 'text-gray-400' : 'text-gray-600'}>
-                        {formatPreview(citation, style)}
-                      </div>
+                      <div key={citation.id} className={darkMode ? 'text-gray-400' : 'text-gray-600'} dangerouslySetInnerHTML={previewHtml(citation, style)} />
                     ))}
                   </div>
                 </div>
@@ -580,8 +638,8 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
                 }
               `}
             >
-              <Plus className="w-5 h-5" />
-              {t(uiLanguage, 'addSource')}
+              {editingId ? <Check className="w-5 h-5" /> : <Plus className="w-5 h-5" />}
+              {editingId ? t(uiLanguage, 'saveSource') : t(uiLanguage, 'addSource')}
             </button>
           )}
 
@@ -598,7 +656,7 @@ const CitationDialog: React.FC<CitationDialogProps> = ({
               `}
             >
               <Check className="w-5 h-5" />
-              {t(uiLanguage, 'insertCitation')}
+              {citationPos !== null ? t(uiLanguage, 'update') : t(uiLanguage, 'insertCitation')}
             </button>
           )}
 

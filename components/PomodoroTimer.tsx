@@ -1,5 +1,5 @@
 import React from 'react';
-import { Play, Pause, RotateCcw, X, Minimize2, Maximize2, Settings } from 'lucide-react';
+import { Play, Pause, RotateCcw, X, Minimize2, Settings } from 'lucide-react';
 import { LanguageCode, t } from '../utils/translations';
 
 interface PomodoroTimerProps {
@@ -10,6 +10,9 @@ interface PomodoroTimerProps {
 }
 
 type PomodoroPhase = 'work' | 'break';
+
+/** Parses a minutes input, clamped to [1, max]. */
+const clampMinutes = (value: string, max: number) => Math.min(max, Math.max(1, parseInt(value, 10) || 1));
 
 export const PomodoroTimer: React.FC<PomodoroTimerProps> = ({
   darkMode,
@@ -22,76 +25,114 @@ export const PomodoroTimer: React.FC<PomodoroTimerProps> = ({
   const [strictBreakMode, setStrictBreakMode] = React.useState(false);
   const [isMinimized, setIsMinimized] = React.useState(false);
   const [showSettings, setShowSettings] = React.useState(false);
+  const strictId = React.useId();
 
   const [phase, setPhase] = React.useState<PomodoroPhase>('work');
   const [timeLeft, setTimeLeft] = React.useState(workDuration * 60);
   const [isRunning, setIsRunning] = React.useState(false);
   const [completedPomodoros, setCompletedPomodoros] = React.useState(0);
 
-  // Notify parent about strict break mode
+  // Absolute end time of the running phase: immune to interval drift and
+  // background-tab throttling.
+  const endAtRef = React.useRef(0);
+  const audioCtxRef = React.useRef<AudioContext | null>(null);
+  const onStrictBreakRef = React.useRef(onStrictBreak);
+  onStrictBreakRef.current = onStrictBreak;
+
+  // Tell the parent whether writing is locked (always report, so unticking
+  // strict mode or closing the timer releases the lock).
+  const locked = strictBreakMode && phase === 'break' && isRunning;
   React.useEffect(() => {
-    if (onStrictBreak && strictBreakMode) {
-      onStrictBreak(phase === 'break' && isRunning);
+    onStrictBreakRef.current?.(locked);
+  }, [locked]);
+  React.useEffect(() => () => {
+    onStrictBreakRef.current?.(false);
+    void audioCtxRef.current?.close().catch(() => {});
+    audioCtxRef.current = null;
+  }, []);
+
+  const playNotificationSound = () => {
+    try {
+      const Ctor = window.AudioContext || (window as any).webkitAudioContext;
+      if (!Ctor) return;
+      if (!audioCtxRef.current) audioCtxRef.current = new Ctor();
+      const audioContext = audioCtxRef.current;
+      void audioContext.resume?.().catch(() => {});
+      const oscillator = audioContext.createOscillator();
+      const gainNode = audioContext.createGain();
+
+      oscillator.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+
+      oscillator.frequency.value = 800;
+      oscillator.type = 'sine';
+
+      gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+
+      oscillator.start(audioContext.currentTime);
+      oscillator.stop(audioContext.currentTime + 0.5);
+      oscillator.onended = () => {
+        oscillator.disconnect();
+        gainNode.disconnect();
+      };
+    } catch {
+      /* audio unavailable */
     }
-  }, [phase, isRunning, strictBreakMode, onStrictBreak]);
+  };
+
+  // Phase transition (runs once per completed phase, outside state updaters)
+  const completePhase = () => {
+    playNotificationSound();
+    if (phase === 'work') {
+      setCompletedPomodoros(c => c + 1);
+      setPhase('break');
+      setTimeLeft(breakDuration * 60);
+      if (strictBreakMode) {
+        // Auto-start the break in strict mode
+        endAtRef.current = Date.now() + breakDuration * 60 * 1000;
+      } else {
+        endAtRef.current = 0;
+        setIsRunning(false);
+      }
+    } else {
+      endAtRef.current = 0;
+      setPhase('work');
+      setTimeLeft(workDuration * 60);
+      setIsRunning(false);
+    }
+  };
+  const completePhaseRef = React.useRef(completePhase);
+  completePhaseRef.current = completePhase;
 
   // Timer countdown logic
   React.useEffect(() => {
     if (!isRunning) return;
-
-    const interval = setInterval(() => {
-      setTimeLeft((prev) => {
-        if (prev <= 1) {
-          // Phase complete
-          if (phase === 'work') {
-            setCompletedPomodoros((c) => c + 1);
-            setPhase('break');
-            playNotificationSound();
-            // Auto-start break if strict mode enabled
-            if (strictBreakMode) {
-              return breakDuration * 60;
-            } else {
-              setIsRunning(false);
-              return breakDuration * 60;
-            }
-          } else {
-            setPhase('work');
-            setIsRunning(false);
-            playNotificationSound();
-            return workDuration * 60;
-          }
-        }
-        return prev - 1;
-      });
-    }, 1000);
-
-    return () => clearInterval(interval);
-  }, [isRunning, phase, workDuration, breakDuration, strictBreakMode]);
-
-  const playNotificationSound = () => {
-    // Create a simple beep sound
-    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-    const oscillator = audioContext.createOscillator();
-    const gainNode = audioContext.createGain();
-
-    oscillator.connect(gainNode);
-    gainNode.connect(audioContext.destination);
-
-    oscillator.frequency.value = 800;
-    oscillator.type = 'sine';
-
-    gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
-    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
-
-    oscillator.start(audioContext.currentTime);
-    oscillator.stop(audioContext.currentTime + 0.5);
-  };
+    const tick = () => {
+      if (!endAtRef.current) return;
+      const remaining = Math.max(0, Math.ceil((endAtRef.current - Date.now()) / 1000));
+      if (remaining <= 0) {
+        completePhaseRef.current();
+        return;
+      }
+      setTimeLeft(prev => (prev === remaining ? prev : remaining));
+    };
+    tick();
+    const interval = window.setInterval(tick, 250);
+    document.addEventListener('visibilitychange', tick);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', tick);
+    };
+  }, [isRunning, phase]);
 
   const toggleTimer = () => {
+    if (!isRunning) endAtRef.current = Date.now() + timeLeft * 1000;
     setIsRunning(!isRunning);
   };
 
   const resetTimer = () => {
+    endAtRef.current = 0;
     setIsRunning(false);
     setTimeLeft(phase === 'work' ? workDuration * 60 : breakDuration * 60);
   };
@@ -113,9 +154,12 @@ export const PomodoroTimer: React.FC<PomodoroTimerProps> = ({
   // Minimized view
   if (isMinimized) {
     return (
-      <div
+      <button
+        type="button"
         className={`${bgColor} backdrop-blur-sm rounded-lg px-3 py-2 shadow-lg border ${borderColor} flex items-center gap-2 cursor-pointer opacity-60 hover:opacity-100 transition-opacity`}
         onClick={() => setIsMinimized(false)}
+        title={t(uiLanguage, 'pomodoroTimer')}
+        aria-label={`${t(uiLanguage, 'pomodoroTimer')} ${formatTime(timeLeft)}`}
       >
         <div className="text-xs font-mono font-bold text-green-500">
           {formatTime(timeLeft)}
@@ -123,7 +167,7 @@ export const PomodoroTimer: React.FC<PomodoroTimerProps> = ({
         {isRunning && (
           <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
         )}
-      </div>
+      </button>
     );
   }
 
@@ -138,14 +182,14 @@ export const PomodoroTimer: React.FC<PomodoroTimerProps> = ({
           <button
             onClick={() => setShowSettings(!showSettings)}
             className={`p-1 rounded transition-colors ${buttonHover} ${showSettings ? 'bg-blue-600 text-white' : ''}`}
-            title="Settings"
+            title={t(uiLanguage, 'settings')}
           >
             <Settings size={16} />
           </button>
           <button
             onClick={() => setIsMinimized(true)}
             className={`p-1 rounded transition-colors ${buttonHover}`}
-            title="Minimize"
+            title={t(uiLanguage, 'minimize')}
           >
             <Minimize2 size={16} />
           </button>
@@ -163,14 +207,14 @@ export const PomodoroTimer: React.FC<PomodoroTimerProps> = ({
       {showSettings && (
         <div className={`mb-4 p-4 rounded-lg ${darkMode ? 'bg-gray-800/50' : 'bg-gray-100'} space-y-3`}>
           <div>
-            <label className="text-xs opacity-60 block mb-1">Work Duration (minutes)</label>
+            <label className="text-xs opacity-60 block mb-1">{t(uiLanguage, 'workDurationMinutes')}</label>
             <input
               type="number"
               min="1"
               max="120"
               value={workDuration}
               onChange={(e) => {
-                const val = parseInt(e.target.value) || 1;
+                const val = clampMinutes(e.target.value, 120);
                 setWorkDuration(val);
                 if (phase === 'work' && !isRunning) {
                   setTimeLeft(val * 60);
@@ -180,14 +224,14 @@ export const PomodoroTimer: React.FC<PomodoroTimerProps> = ({
             />
           </div>
           <div>
-            <label className="text-xs opacity-60 block mb-1">Break Duration (minutes)</label>
+            <label className="text-xs opacity-60 block mb-1">{t(uiLanguage, 'breakDurationMinutes')}</label>
             <input
               type="number"
               min="1"
               max="60"
               value={breakDuration}
               onChange={(e) => {
-                const val = parseInt(e.target.value) || 1;
+                const val = clampMinutes(e.target.value, 60);
                 setBreakDuration(val);
                 if (phase === 'break' && !isRunning) {
                   setTimeLeft(val * 60);
@@ -199,13 +243,13 @@ export const PomodoroTimer: React.FC<PomodoroTimerProps> = ({
           <div className="flex items-center gap-2">
             <input
               type="checkbox"
-              id="strictBreak"
+              id={strictId}
               checked={strictBreakMode}
               onChange={(e) => setStrictBreakMode(e.target.checked)}
               className="w-4 h-4 accent-blue-600 cursor-pointer"
             />
-            <label htmlFor="strictBreak" className="text-xs cursor-pointer">
-              Strict Break Mode (disable writing during breaks)
+            <label htmlFor={strictId} className="text-xs cursor-pointer">
+              {t(uiLanguage, 'strictBreakMode')}
             </label>
           </div>
         </div>

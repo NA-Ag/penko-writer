@@ -1,240 +1,333 @@
 /**
- * Markdown ↔ HTML Converter
- * Converts between Markdown and HTML for Penko Writer
+ * Markdown <-> HTML conversion for Penko Writer.
+ *
+ * - markdown -> HTML: `marked` (GitHub Flavored Markdown) plus small inline
+ *   extensions for footnotes (`[^1]` / `[^1]: text`) and equations
+ *   (`$x$`, `$$x$$`). The result is always sanitized.
+ * - HTML -> markdown: `turndown` + `turndown-plugin-gfm`, with rules for the
+ *   editor's custom nodes (footnotes, equations, citations, page breaks,
+ *   highlights, code blocks, tables).
  */
+import { Marked, type TokenizerAndRendererExtension } from 'marked';
+import TurndownService from 'turndown';
+import { gfm } from 'turndown-plugin-gfm';
+import { escapeHtml, sanitizeHtml } from '../editor/sanitize';
 
-// Convert HTML to Markdown
-export const htmlToMarkdown = (html: string): string => {
-  let markdown = html;
+/* ------------------------------------------------------------------ */
+/* Markdown -> HTML                                                    */
+/* ------------------------------------------------------------------ */
 
-  // Remove empty paragraphs and normalize whitespace
-  markdown = markdown.replace(/<p><br><\/p>/g, '\n');
-  markdown = markdown.replace(/<p>\s*<\/p>/g, '\n');
+interface FootnoteState {
+  defs: Map<string, string>;
+  counters: { footnote: number; endnote: number };
+  numbers: Map<string, number>;
+}
 
-  // Headers (h1-h6)
-  markdown = markdown.replace(/<h1[^>]*>(.*?)<\/h1>/gi, '# $1\n\n');
-  markdown = markdown.replace(/<h2[^>]*>(.*?)<\/h2>/gi, '## $1\n\n');
-  markdown = markdown.replace(/<h3[^>]*>(.*?)<\/h3>/gi, '### $1\n\n');
-  markdown = markdown.replace(/<h4[^>]*>(.*?)<\/h4>/gi, '#### $1\n\n');
-  markdown = markdown.replace(/<h5[^>]*>(.*?)<\/h5>/gi, '##### $1\n\n');
-  markdown = markdown.replace(/<h6[^>]*>(.*?)<\/h6>/gi, '###### $1\n\n');
+let fnState: FootnoteState = { defs: new Map(), counters: { footnote: 0, endnote: 0 }, numbers: new Map() };
 
-  // Bold
-  markdown = markdown.replace(/<strong[^>]*>(.*?)<\/strong>/gi, '**$1**');
-  markdown = markdown.replace(/<b[^>]*>(.*?)<\/b>/gi, '**$1**');
+const isEndnoteLabel = (label: string) => /^en\d+$/i.test(label);
 
-  // Italic
-  markdown = markdown.replace(/<em[^>]*>(.*?)<\/em>/gi, '*$1*');
-  markdown = markdown.replace(/<i[^>]*>(.*?)<\/i>/gi, '*$1*');
-
-  // Underline (not standard markdown, use HTML)
-  markdown = markdown.replace(/<u[^>]*>(.*?)<\/u>/gi, '<u>$1</u>');
-
-  // Strikethrough
-  markdown = markdown.replace(/<s[^>]*>(.*?)<\/s>/gi, '~~$1~~');
-  markdown = markdown.replace(/<strike[^>]*>(.*?)<\/strike>/gi, '~~$1~~');
-  markdown = markdown.replace(/<del[^>]*>(.*?)<\/del>/gi, '~~$1~~');
-
-  // Links
-  markdown = markdown.replace(/<a[^>]*href=["']([^"']*)["'][^>]*>(.*?)<\/a>/gi, '[$2]($1)');
-
-  // Images
-  markdown = markdown.replace(/<img[^>]*src=["']([^"']*)["'][^>]*alt=["']([^"']*)["'][^>]*\/?>/gi, '![$2]($1)');
-  markdown = markdown.replace(/<img[^>]*alt=["']([^"']*)["'][^>]*src=["']([^"']*)["'][^>]*\/?>/gi, '![$1]($2)');
-  markdown = markdown.replace(/<img[^>]*src=["']([^"']*)["'][^>]*\/?>/gi, '![]($1)');
-
-  // Code blocks
-  markdown = markdown.replace(/<pre[^>]*><code[^>]*class=["']language-([^"']*)["'][^>]*>(.*?)<\/code><\/pre>/gis, '```$1\n$2\n```\n\n');
-  markdown = markdown.replace(/<pre[^>]*><code[^>]*>(.*?)<\/code><\/pre>/gis, '```\n$1\n```\n\n');
-
-  // Inline code
-  markdown = markdown.replace(/<code[^>]*>(.*?)<\/code>/gi, '`$1`');
-
-  // Unordered lists
-  markdown = markdown.replace(/<ul[^>]*>(.*?)<\/ul>/gis, (match, content) => {
-    const items = content.match(/<li[^>]*>(.*?)<\/li>/gis);
-    if (!items) return match;
-    return items.map((item: string) => {
-      const text = item.replace(/<li[^>]*>(.*?)<\/li>/is, '$1').trim();
-      return `- ${text}`;
-    }).join('\n') + '\n\n';
-  });
-
-  // Ordered lists
-  markdown = markdown.replace(/<ol[^>]*>(.*?)<\/ol>/gis, (match, content) => {
-    const items = content.match(/<li[^>]*>(.*?)<\/li>/gis);
-    if (!items) return match;
-    return items.map((item: string, index: number) => {
-      const text = item.replace(/<li[^>]*>(.*?)<\/li>/is, '$1').trim();
-      return `${index + 1}. ${text}`;
-    }).join('\n') + '\n\n';
-  });
-
-  // Blockquotes
-  markdown = markdown.replace(/<blockquote[^>]*>(.*?)<\/blockquote>/gis, (match, content) => {
-    const lines = content.trim().split('\n');
-    return lines.map(line => `> ${line.trim()}`).join('\n') + '\n\n';
-  });
-
-  // Horizontal rule
-  markdown = markdown.replace(/<hr[^>]*\/?>/gi, '\n---\n\n');
-
-  // Tables
-  markdown = markdown.replace(/<table[^>]*>(.*?)<\/table>/gis, (match, content) => {
-    const rows = content.match(/<tr[^>]*>(.*?)<\/tr>/gis);
-    if (!rows || rows.length === 0) return match;
-
-    const tableMarkdown: string[] = [];
-
-    rows.forEach((row, rowIndex) => {
-      const cells = row.match(/<t[hd][^>]*>(.*?)<\/t[hd]>/gis);
-      if (!cells) return;
-
-      const cellContents = cells.map(cell =>
-        cell.replace(/<t[hd][^>]*>(.*?)<\/t[hd]>/is, '$1').trim()
-      );
-
-      tableMarkdown.push('| ' + cellContents.join(' | ') + ' |');
-
-      // Add separator after header row
-      if (rowIndex === 0) {
-        tableMarkdown.push('| ' + cellContents.map(() => '---').join(' | ') + ' |');
-      }
-    });
-
-    return tableMarkdown.join('\n') + '\n\n';
-  });
-
-  // Paragraphs
-  markdown = markdown.replace(/<p[^>]*>(.*?)<\/p>/gis, '$1\n\n');
-
-  // Line breaks
-  markdown = markdown.replace(/<br\s*\/?>/gi, '  \n');
-
-  // Remove remaining HTML tags
-  markdown = markdown.replace(/<[^>]+>/g, '');
-
-  // Decode HTML entities
-  markdown = markdown.replace(/&nbsp;/g, ' ');
-  markdown = markdown.replace(/&amp;/g, '&');
-  markdown = markdown.replace(/&lt;/g, '<');
-  markdown = markdown.replace(/&gt;/g, '>');
-  markdown = markdown.replace(/&quot;/g, '"');
-  markdown = markdown.replace(/&#39;/g, "'");
-
-  // Clean up extra newlines
-  markdown = markdown.replace(/\n{3,}/g, '\n\n');
-  markdown = markdown.trim();
-
-  return markdown;
+const footnoteDef: TokenizerAndRendererExtension = {
+  name: 'penkoFootnoteDef',
+  level: 'block',
+  start(src: string) {
+    const m = src.match(/(^|\n)\[\^[^\]\s]+\]:/);
+    return m ? (m.index || 0) + m[1].length : undefined;
+  },
+  tokenizer(src: string) {
+    const m = /^\[\^([^\]\s]+)\]:[ \t]*([^\n]*(?:\n(?: {2,}|\t)[^\n]*)*)(?:\n+|$)/.exec(src);
+    if (!m) return undefined;
+    fnState.defs.set(m[1], m[2].replace(/\n\s+/g, ' ').trim());
+    return { type: 'penkoFootnoteDef', raw: m[0] };
+  },
+  renderer() {
+    return '';
+  },
 };
 
-// Convert Markdown to HTML
+const footnoteRef: TokenizerAndRendererExtension = {
+  name: 'penkoFootnoteRef',
+  level: 'inline',
+  start(src: string) {
+    const i = src.indexOf('[^');
+    return i >= 0 ? i : undefined;
+  },
+  tokenizer(src: string) {
+    const m = /^\[\^([^\]\s]+)\](?!:)/.exec(src);
+    if (!m) return undefined;
+    return { type: 'penkoFootnoteRef', raw: m[0], label: m[1] };
+  },
+  renderer(token: any) {
+    const label = token.label as string;
+    const noteType = isEndnoteLabel(label) ? 'endnote' : 'footnote';
+    let n = fnState.numbers.get(label);
+    if (!n) {
+      n = ++fnState.counters[noteType];
+      fnState.numbers.set(label, n);
+    }
+    const content = fnState.defs.get(label) || '';
+    return `<sup data-type="footnote" data-note-type="${noteType}" data-number="${n}" data-content="${escapeHtml(content)}">${n}</sup>`;
+  },
+};
+
+const blockMath: TokenizerAndRendererExtension = {
+  name: 'penkoBlockMath',
+  level: 'block',
+  start(src: string) {
+    const m = src.match(/(^|\n)\$\$/);
+    return m ? (m.index || 0) + m[1].length : undefined;
+  },
+  tokenizer(src: string) {
+    const m = /^\$\$([\s\S]+?)\$\$[ \t]*(?:\n+|$)/.exec(src);
+    if (!m) return undefined;
+    return { type: 'penkoBlockMath', raw: m[0], latex: m[1].trim() };
+  },
+  renderer(token: any) {
+    return `<p><span data-type="equation" data-display="true" data-latex="${escapeHtml(token.latex)}"></span></p>\n`;
+  },
+};
+
+const inlineMath: TokenizerAndRendererExtension = {
+  name: 'penkoInlineMath',
+  level: 'inline',
+  start(src: string) {
+    const i = src.indexOf('$');
+    return i >= 0 ? i : undefined;
+  },
+  tokenizer(src: string) {
+    // $$display$$ inside a paragraph, or $inline$ (pandoc rules: no space
+    // after the opening / before the closing $, closing $ not followed by a digit)
+    let m = /^\$\$([^$]+?)\$\$/.exec(src);
+    if (m) return { type: 'penkoInlineMath', raw: m[0], latex: m[1].trim(), display: true };
+    m = /^\$(?=\S)((?:\\\$|[^$\n])+?)(?<=\S)\$(?!\d)/.exec(src);
+    if (m) return { type: 'penkoInlineMath', raw: m[0], latex: m[1], display: false };
+    return undefined;
+  },
+  renderer(token: any) {
+    return `<span data-type="equation"${token.display ? ' data-display="true"' : ''} data-latex="${escapeHtml(token.latex)}"></span>`;
+  },
+};
+
+const md = new Marked({ gfm: true, breaks: false, extensions: [footnoteDef, footnoteRef, blockMath, inlineMath] } as any);
+
+/** Convert (GitHub Flavored) Markdown to sanitized HTML. */
 export const markdownToHtml = (markdown: string): string => {
-  let html = markdown;
-
-  // Escape HTML first
-  const escapeHtml = (text: string) => {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-  };
-
-  // Process code blocks first (to protect them from other transformations)
-  const codeBlocks: string[] = [];
-  html = html.replace(/```(\w+)?\n([\s\S]*?)```/g, (match, lang, code) => {
-    const placeholder = `__CODE_BLOCK_${codeBlocks.length}__`;
-    const langClass = lang ? ` class="language-${lang}"` : '';
-    codeBlocks.push(`<pre><code${langClass}>${escapeHtml(code.trim())}</code></pre>`);
-    return placeholder;
-  });
-
-  // Inline code
-  const inlineCode: string[] = [];
-  html = html.replace(/`([^`]+)`/g, (match, code) => {
-    const placeholder = `__INLINE_CODE_${inlineCode.length}__`;
-    inlineCode.push(`<code>${escapeHtml(code)}</code>`);
-    return placeholder;
-  });
-
-  // Headers
-  html = html.replace(/^######\s+(.+)$/gm, '<h6>$1</h6>');
-  html = html.replace(/^#####\s+(.+)$/gm, '<h5>$1</h5>');
-  html = html.replace(/^####\s+(.+)$/gm, '<h4>$1</h4>');
-  html = html.replace(/^###\s+(.+)$/gm, '<h3>$1</h3>');
-  html = html.replace(/^##\s+(.+)$/gm, '<h2>$1</h2>');
-  html = html.replace(/^#\s+(.+)$/gm, '<h1>$1</h1>');
-
-  // Bold (strong) - must come before italic
-  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  html = html.replace(/__(.+?)__/g, '<strong>$1</strong>');
-
-  // Italic (em)
-  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-  html = html.replace(/_(.+?)_/g, '<em>$1</em>');
-
-  // Strikethrough
-  html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
-
-  // Links - must come before images
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
-
-  // Images
-  html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" />');
-
-  // Horizontal rule
-  html = html.replace(/^---$/gm, '<hr />');
-  html = html.replace(/^\*\*\*$/gm, '<hr />');
-
-  // Blockquotes
-  html = html.replace(/^>\s+(.+)$/gm, '<blockquote>$1</blockquote>');
-  html = html.replace(/<\/blockquote>\n<blockquote>/g, '\n');
-
-  // Unordered lists
-  html = html.replace(/^[-*+]\s+(.+)$/gm, '<li>$1</li>');
-  html = html.replace(/(<li>.*<\/li>)\n(?!<li>)/g, '<ul>$1</ul>\n');
-  html = html.replace(/(?<!<\/ul>)\n(<li>)/g, '\n<ul>$1');
-  html = html.replace(/(<\/li>)\n(<li>)/g, '$1$2');
-
-  // Ordered lists
-  html = html.replace(/^\d+\.\s+(.+)$/gm, '<li>$1</li>');
-  // Note: This is simplified - a more robust implementation would be needed for mixed lists
-
-  // Tables
-  html = html.replace(/^\|(.+)\|$/gm, (match, content) => {
-    const cells = content.split('|').map((cell: string) => cell.trim());
-    const isHeaderSeparator = cells.every((cell: string) => /^-+$/.test(cell));
-    if (isHeaderSeparator) return '<__TABLE_SEP__>';
-
-    const cellTags = cells.map((cell: string) => `<td>${cell}</td>`).join('');
-    return `<tr>${cellTags}</tr>`;
-  });
-
-  html = html.replace(/<tr>.*?<\/tr>\n<__TABLE_SEP__>\n/g, (match) => {
-    return match.replace(/<td>/g, '<th>').replace(/<\/td>/g, '</th>').replace('\n<__TABLE_SEP__>\n', '\n');
-  });
-
-  html = html.replace(/(<tr>.*<\/tr>\n?)+/g, '<table>$&</table>');
-
-  // Paragraphs - wrap text that's not already in a block element
-  html = html.split('\n\n').map(block => {
-    if (block.trim() === '') return '';
-    if (block.match(/^<(h[1-6]|ul|ol|blockquote|pre|table|hr)/)) return block;
-    return `<p>${block.trim()}</p>`;
-  }).join('\n');
-
-  // Line breaks
-  html = html.replace(/  \n/g, '<br>');
-
-  // Restore code blocks
-  codeBlocks.forEach((code, index) => {
-    html = html.replace(`__CODE_BLOCK_${index}__`, code);
-  });
-
-  // Restore inline code
-  inlineCode.forEach((code, index) => {
-    html = html.replace(`__INLINE_CODE_${index}__`, code);
-  });
-
-  return html;
+  if (!markdown || !markdown.trim()) return '<p></p>';
+  fnState = { defs: new Map(), counters: { footnote: 0, endnote: 0 }, numbers: new Map() };
+  const html = md.parse(markdown.replace(/\r\n?/g, '\n'), { async: false }) as string;
+  return sanitizeHtml(html);
 };
+
+/* ------------------------------------------------------------------ */
+/* HTML -> Markdown                                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Markdown-escape plain text. Less aggressive than turndown's default: only
+ * characters that would actually change meaning are escaped, so `snake_case`
+ * and `2 * 3` stay readable.
+ */
+const escapeMarkdownText = (text: string): string => {
+  let s = text
+    .replace(/\\/g, '\\\\')
+    .replace(/`/g, '\\`')
+    .replace(/\*/g, (_m, offset: number, str: string) => {
+      const prev = str[offset - 1] || ' ';
+      const next = str[offset + 1] || ' ';
+      return /\s/.test(prev) && /\s/.test(next) ? '*' : '\\*';
+    })
+    // underscores only matter at word boundaries (intraword _ is literal in GFM)
+    .replace(/_/g, (_m, offset: number, str: string) => {
+      const prev = str[offset - 1] || ' ';
+      const next = str[offset + 1] || ' ';
+      return /[A-Za-z0-9]/.test(prev) && /[A-Za-z0-9]/.test(next) ? '_' : '\\_';
+    })
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
+    .replace(/~~/g, '\\~\\~')
+    .replace(/\$/g, '\\$')
+    .replace(/&(?=#?\w+;)/g, '&amp;')
+    .replace(/<(?=[A-Za-z/!?])/g, '&lt;');
+  // block-level markers at the start of a line
+  s = s
+    .replace(/^(\s*)#/gm, '$1\\#')
+    .replace(/^(\s*)>/gm, '$1\\>')
+    .replace(/^(\s*)([-+])(\s)/gm, '$1\\$2$3')
+    .replace(/^(\s*)(\d+)\.(\s)/gm, '$1$2\\.$3')
+    .replace(/^(\s*)(=+|-{3,})(\s*)$/gm, '$1\\$2$3')
+    .replace(/\|/g, '\\|');
+  return s;
+};
+
+const PAGE_BREAK_MD = '\n\n<div data-type="page-break" style="page-break-after: always"></div>\n\n';
+
+const equationMarkdown = (el: HTMLElement) => {
+  const latex = el.getAttribute('data-latex') || '';
+  return el.getAttribute('data-display') === 'true' ? `$$${latex}$$` : `$${latex}$`;
+};
+
+let noteDefs: string[] = [];
+let noteCounters = { footnote: 0, endnote: 0 };
+
+const cellMarkdown = (service: TurndownService, cell: HTMLElement) =>
+  service
+    .turndown(cell.innerHTML)
+    .replace(/\n+/g, '<br>')
+    .replace(/(?<!\\)\|/g, '\\|')
+    .trim();
+
+const createTurndown = () => {
+  const service = new TurndownService({
+    headingStyle: 'atx',
+    hr: '---',
+    bulletListMarker: '-',
+    codeBlockStyle: 'fenced',
+    fence: '```',
+    emDelimiter: '*',
+    strongDelimiter: '**',
+    linkStyle: 'inlined',
+    // Atom nodes (equations, page breaks) have no text; don't drop them as blank.
+    blankReplacement: (_content, node: any) => {
+      const type = node.getAttribute?.('data-type');
+      if (type === 'equation') return equationMarkdown(node);
+      if (type === 'page-break') return PAGE_BREAK_MD;
+      return node.isBlock ? '\n\n' : '';
+    },
+  });
+  (service as any).escape = escapeMarkdownText;
+  service.use(gfm);
+
+  // Named "Title" paragraphs read as the document's top heading
+  service.addRule('penkoTitle', {
+    filter: node => node.nodeName === 'P' && (node as HTMLElement).getAttribute('data-style') === 'title',
+    replacement: content => (content.trim() ? `\n\n# ${content.trim()}\n\n` : ''),
+  });
+
+  service.addRule('penkoHighlight', {
+    filter: 'mark',
+    replacement: content => (content ? `<mark>${content}</mark>` : ''),
+  });
+
+  service.addRule('penkoUnderline', {
+    filter: ['u', 'ins'] as any,
+    replacement: (content, node) =>
+      content && !(node as HTMLElement).classList?.contains('track-insert') ? `<u>${content}</u>` : content,
+  });
+
+  service.addRule('penkoSubSup', {
+    filter: ['sub', 'sup'] as any,
+    replacement: (content, node) => (content ? `<${node.nodeName.toLowerCase()}>${content}</${node.nodeName.toLowerCase()}>` : ''),
+  });
+
+  service.addRule('penkoKbd', {
+    filter: 'kbd' as any,
+    replacement: content => (content ? `<kbd>${content}</kbd>` : ''),
+  });
+
+  service.addRule('penkoStrike', {
+    filter: ['del', 's', 'strike'] as any,
+    replacement: content => (content.trim() ? `~~${content}~~` : content),
+  });
+
+  service.addRule('penkoFencedCode', {
+    filter: node => node.nodeName === 'PRE',
+    replacement: (_content, node) => {
+      const el = node as HTMLElement;
+      const code = el.querySelector('code');
+      const cls = `${code?.className || ''} ${el.className || ''}`;
+      let lang = el.getAttribute('data-language') || (cls.match(/language-([\w+#-]+)/) || [])[1] || '';
+      if (lang === 'plaintext' || lang === 'text') lang = '';
+      const text = (code || el).textContent || '';
+      const longest = Math.max(2, ...(text.match(/`+/g) || []).map(s => s.length));
+      const fence = '`'.repeat(longest + 1);
+      return `\n\n${fence}${lang}\n${text.replace(/\n$/, '')}\n${fence}\n\n`;
+    },
+  });
+
+  service.addRule('penkoTable', {
+    filter: 'table',
+    replacement: (_content, node) => {
+      const table = node as HTMLTableElement;
+      const rows = Array.from(table.rows);
+      if (!rows.length) return '';
+      const hasSpans = table.querySelector('[colspan]:not([colspan="1"]),[rowspan]:not([rowspan="1"])');
+      if (hasSpans) return `\n\n${table.outerHTML}\n\n`;
+      const cols = Math.max(...rows.map(r => r.cells.length));
+      const toLine = (cells: string[]) => `| ${Array.from({ length: cols }, (_, i) => cells[i] ?? '').join(' | ')} |`;
+      const lines: string[] = [];
+      rows.forEach((row, i) => {
+        lines.push(toLine(Array.from(row.cells).map(c => cellMarkdown(service, c as HTMLElement))));
+        if (i === 0) lines.push(toLine(Array.from({ length: cols }, () => '---')));
+      });
+      return `\n\n${lines.join('\n')}\n\n`;
+    },
+  });
+
+  service.addRule('penkoFootnote', {
+    filter: node => node.nodeName === 'SUP' && (node as HTMLElement).getAttribute('data-type') === 'footnote',
+    replacement: (_content, node) => {
+      const el = node as HTMLElement;
+      const kind = el.getAttribute('data-note-type') === 'endnote' ? 'endnote' : 'footnote';
+      const n = ++noteCounters[kind];
+      const label = kind === 'endnote' ? `en${n}` : String(n);
+      noteDefs.push(`[^${label}]: ${(el.getAttribute('data-content') || '').replace(/\s+/g, ' ').trim()}`);
+      return `[^${label}]`;
+    },
+  });
+
+  service.addRule('penkoEquation', {
+    filter: node => (node as HTMLElement).getAttribute?.('data-type') === 'equation',
+    replacement: (_content, node) => equationMarkdown(node as HTMLElement),
+  });
+
+  service.addRule('penkoCitation', {
+    filter: node => (node as HTMLElement).getAttribute?.('data-type') === 'citation',
+    replacement: (_content, node) => escapeMarkdownText(node.textContent || ''),
+  });
+
+  service.addRule('penkoPageBreak', {
+    filter: node => (node as HTMLElement).getAttribute?.('data-type') === 'page-break',
+    replacement: () => PAGE_BREAK_MD,
+  });
+
+  // Tiptap's resize wrappers or empty spans should never leave artefacts
+  service.addRule('penkoImage', {
+    filter: 'img',
+    replacement: (_content, node) => {
+      const el = node as HTMLImageElement;
+      const src = el.getAttribute('src') || '';
+      if (!src) return '';
+      const alt = (el.getAttribute('alt') || '').replace(/[[\]]/g, '');
+      const title = el.getAttribute('title');
+      return `![${alt}](${src.replace(/\)/g, '%29').replace(/ /g, '%20')}${title ? ` "${title.replace(/"/g, '\\"')}"` : ''})`;
+    },
+  });
+
+  return service;
+};
+
+let turndownInstance: TurndownService | null = null;
+
+/** Convert editor HTML to GitHub Flavored Markdown. */
+export const htmlToMarkdown = (html: string): string => {
+  if (!html || !html.trim()) return '';
+  if (!turndownInstance) turndownInstance = createTurndown();
+  noteDefs = [];
+  noteCounters = { footnote: 0, endnote: 0 };
+  // Tiptap wraps list item content in <p>; unwrap so lists stay tight.
+  let body = html;
+  if (typeof DOMParser !== 'undefined') {
+    const doc = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
+    doc.body.querySelectorAll('li > p:only-child, th > p:only-child, td > p:only-child').forEach(p => {
+      while (p.firstChild) p.parentNode!.insertBefore(p.firstChild, p);
+      p.remove();
+    });
+    body = doc.body.innerHTML;
+  }
+  let out = turndownInstance.turndown(body);
+  if (noteDefs.length) out += `\n\n${noteDefs.join('\n')}`;
+  return out.replace(/\n{3,}/g, '\n\n').trim() + '\n';
+};
+
+/** True when the HTML contains nothing a user would call content. */
+export const isHtmlEmpty = (html: string): boolean => !html || !html.replace(/<(p|br)\s*\/?>|<\/p>/gi, '').trim();

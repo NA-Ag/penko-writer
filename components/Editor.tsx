@@ -1,618 +1,298 @@
-import React, { useEffect, useRef, forwardRef, useImperativeHandle, useState } from 'react';
-import { PageConfig, EditorHandle, SelectionContext } from '../types';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useEditor, EditorContent } from '@tiptap/react';
+import type { Editor as TiptapEditor } from '@tiptap/core';
+import { DocumentData } from '../types';
 import { PAGE_MARGINS, PAGE_SIZES } from '../constants';
-import { useScreenplayEditor } from '../utils/useScreenplayEditor';
-import { useApp } from '../AppContext';
+import { useApp, useSetSelectionContext } from '../AppContext';
+import { createExtensions } from '../editor/extensions';
+import { computeSelectionContext } from '../editor/commands';
+import { prepareHtmlForEditor, sanitizeHtml, parseOptionsFor } from '../editor/sanitize';
+import { noteLabel } from '../editor/extensions/references';
+import { pageAtPos, buildNotes, pageFrame, pageTops, type PageNote } from '../editor/extensions/pagination';
+import { zoneHtml } from '../editor/pageChrome';
+import { resolveSection, sectionOfPage, displayPageNumber, type SectionInfo } from '../editor/extensions/sections';
+import { t } from '../utils/translations';
+import '../editor/editor.css';
 
-interface EditorProps {
+const COMMIT_DEBOUNCE_MS = 300;
+
+const cssLengthToPx = (value: string) => {
+  const n = parseFloat(value);
+  if (value.endsWith('mm')) return n * 3.7795;
+  if (value.endsWith('cm')) return (n * 96) / 2.54;
+  if (value.endsWith('in')) return n * 96;
+  return n;
+};
+
+/**
+ * Word/character counts for the status bar. The plain text (only needed by the
+ * stats dialog, assistant, etc.) is computed on first read, not on every save.
+ */
+const statsOf = (editor: TiptapEditor) => {
+  let text: string | null = null;
+  // A just-destroyed editor (React StrictMode remount) has no storage any more
+  const counter = editor.isDestroyed ? undefined : (editor.storage as any).characterCount;
+  return {
+    words: counter ? counter.words() : 0,
+    characters: counter ? counter.characters() : 0,
+    get text() {
+      if (text === null) text = editor.isDestroyed ? '' : editor.getText({ blockSeparator: '\n' });
+      return text;
+    },
+  };
+};
+
+/** Copies the content of the old `doc.footnotes` array into footnote nodes. */
+const migrateLegacyFootnotes = (editor: TiptapEditor, doc: DocumentData) => {
+  if (!doc.footnotes?.length) return;
+  const tr = editor.state.tr;
+  let changed = false;
+  editor.state.doc.descendants((node, pos) => {
+    if (node.type.name !== 'footnote' || node.attrs.content) return true;
+    const legacy = doc.footnotes!.find(f => f.type === node.attrs.noteType && String(f.number) === String(node.attrs.legacyNumber ?? node.attrs.number));
+    if (legacy) {
+      tr.setNodeMarkup(pos, undefined, { ...node.attrs, content: legacy.content });
+      changed = true;
+    }
+    return false;
+  });
+  if (changed) {
+    tr.setMeta('addToHistory', false).setMeta('preventTrack', true);
+    editor.view.dispatch(tr);
+  }
+};
+
+interface NoteItem {
+  pos: number;
+  number: number;
+  noteType: 'footnote' | 'endnote';
   content: string;
-  onChange: (html: string, text: string) => void;
-  zoom: number;
-  pageConfig?: PageConfig;
-  darkMode: boolean;
-  pasteAsPlainText: boolean;
-  language?: string;
-  onContextChange: (ctx: SelectionContext) => void;
-  header?: string;
-  footer?: string;
-  showPageNumbers?: boolean;
-  pageNumberPosition?: 'header-left' | 'header-center' | 'header-right' | 'footer-left' | 'footer-center' | 'footer-right';
-  isScreenplay?: boolean;
 }
 
-export const Editor = forwardRef<EditorHandle, EditorProps>(({ content, onChange, zoom, pageConfig, darkMode, pasteAsPlainText, language = 'en-US', onContextChange, header, footer, showPageNumbers, pageNumberPosition, isScreenplay = false }, ref) => {
-  const contentRef = useRef<HTMLDivElement>(null);
-  const isInternalUpdate = useRef(false);
-  const [selectedImage, setSelectedImage] = useState<HTMLImageElement | null>(null);
-  const { isPaintingFormat } = useApp();
+const collectNotes = (editor: TiptapEditor): NoteItem[] => {
+  const notes: NoteItem[] = [];
+  editor.state.doc.descendants((node, pos) => {
+    if (node.type.name === 'footnote') notes.push({ pos, number: node.attrs.number, noteType: node.attrs.noteType, content: node.attrs.content });
+    return true;
+  });
+  return notes;
+};
 
-  // Screenplay mode hook
-  const { getCharacterSuggestions } = useScreenplayEditor(contentRef, isScreenplay);
+/** `fitWidth` (mobile): the page takes the container width with slim margins, unscaled and unpaginated, so text stays readable. */
+export const Editor: React.FC<{ doc: DocumentData; fitWidth?: boolean }> = ({ doc, fitWidth = false }) => {
+  const {
+    zoom,
+    darkMode,
+    pasteAsPlainText,
+    isPaintingFormat,
+    applyPaintFormat,
+    setActiveEditor,
+    registerEditorFlush,
+    updateCurrentDoc,
+    setStats,
+    setSelectedImage,
+    contentRevision,
+    handleInsertImageFiles,
+    setEditingFootnote,
+    setShowFootnoteDialog,
+    setEditingEquation,
+    setShowEquationDialog,
+    collabSession,
+    uiLanguage,
+    setPageInfo,
+    openHeaderFooter,
+  } = useApp();
+  const setSelectionContext = useSetSelectionContext();
 
-  // --- Imperative Handle for Parent ---
-  useImperativeHandle(ref, () => ({
-    focus: () => contentRef.current?.focus(),
-    getInnerHtml: () => contentRef.current?.innerHTML || '',
-    getInnerText: () => contentRef.current?.innerText || '',
-    getContentElement: () => contentRef.current,
+  const collab = collabSession && collabSession.docId === doc.id ? collabSession : null;
+  const pasteRef = useRef(pasteAsPlainText);
+  pasteRef.current = pasteAsPlainText;
+  const insertFilesRef = useRef(handleInsertImageFiles);
+  insertFilesRef.current = handleInsertImageFiles;
 
-    // Table Methods
-    addTableRow: () => {
-      const selection = window.getSelection();
-      if (!selection?.anchorNode) return;
-      const tr = (selection.anchorNode as HTMLElement).closest?.('tr') || (selection.anchorNode.parentElement as HTMLElement).closest('tr');
-      if (tr) {
-        const newRow = tr.cloneNode(true) as HTMLTableRowElement;
-        // Clear content in new row
-        Array.from(newRow.cells).forEach(cell => cell.innerHTML = '&nbsp;');
-        tr.parentElement?.insertBefore(newRow, tr.nextSibling);
-        handleInput();
-      }
-    },
-    deleteTableRow: () => {
-      const selection = window.getSelection();
-      if (!selection?.anchorNode) return;
-      const tr = (selection.anchorNode as HTMLElement).closest?.('tr') || (selection.anchorNode.parentElement as HTMLElement).closest('tr');
-      if (tr) {
-        tr.remove();
-        handleInput();
-      }
-    },
-    addTableColumn: () => {
-        const selection = window.getSelection();
-        if (!selection?.anchorNode) return;
-        const cell = (selection.anchorNode as HTMLElement).closest?.('td, th') || (selection.anchorNode.parentElement as HTMLElement).closest('td, th');
-        if (cell) {
-            const cellIndex = (cell as HTMLTableCellElement).cellIndex;
-            const table = (cell as HTMLElement).closest('table');
-            if(table) {
-                Array.from(table.rows).forEach(row => {
-                    const newCell = row.insertCell(cellIndex + 1);
-                    newCell.innerHTML = '&nbsp;';
-                    newCell.style.border = '1px solid ' + (darkMode ? '#666' : '#ccc');
-                    newCell.style.padding = '5px';
-                });
-                handleInput();
-            }
-        }
-    },
-    deleteTableColumn: () => {
-        const selection = window.getSelection();
-        if (!selection?.anchorNode) return;
-        const cell = (selection.anchorNode as HTMLElement).closest?.('td, th') || (selection.anchorNode.parentElement as HTMLElement).closest('td, th');
-        if (cell) {
-            const cellIndex = (cell as HTMLTableCellElement).cellIndex;
-            const table = (cell as HTMLElement).closest('table');
-            if(table) {
-                Array.from(table.rows).forEach(row => {
-                    if(row.cells.length > cellIndex) row.deleteCell(cellIndex);
-                });
-                handleInput();
-            }
-        }
-    },
+  const dirty = useRef(false);
+  const commitTimer = useRef<number>(0);
+  const selectionFrame = useRef<number>(0);
+  const [notes, setNotes] = useState<NoteItem[]>([]);
 
-    // Cell Merging
-    mergeCells: () => {
-        const selection = window.getSelection();
-        if (!selection?.anchorNode) return;
-        const cell = (selection.anchorNode as HTMLElement).closest?.('td, th') || (selection.anchorNode.parentElement as HTMLElement).closest('td, th');
-        if (cell) {
-            const currentCell = cell as HTMLTableCellElement;
-            const nextCell = currentCell.nextElementSibling as HTMLTableCellElement;
+  const commitRef = useRef<() => void>(() => {});
 
-            if (nextCell && nextCell.tagName === currentCell.tagName) {
-                // Merge horizontally
-                const currentColSpan = parseInt(currentCell.getAttribute('colspan') || '1');
-                const nextColSpan = parseInt(nextCell.getAttribute('colspan') || '1');
-                currentCell.setAttribute('colspan', (currentColSpan + nextColSpan).toString());
-                currentCell.innerHTML += ' ' + nextCell.innerHTML;
-                nextCell.remove();
-                handleInput();
-            }
-        }
-    },
+  // Only used when the editor is (re)created — never recomputed while typing,
+  // since sanitizing a long document is expensive.
+  const initialContent = useMemo(
+    () => (collab ? undefined : prepareHtmlForEditor(doc.content)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [doc.id, collab?.document],
+  );
+  const extensions = useMemo(() => createExtensions({ collaboration: collab }), [collab?.document]);
 
-    splitCell: () => {
-        const selection = window.getSelection();
-        if (!selection?.anchorNode) return;
-        const cell = (selection.anchorNode as HTMLElement).closest?.('td, th') || (selection.anchorNode.parentElement as HTMLElement).closest('td, th');
-        if (cell) {
-            const currentCell = cell as HTMLTableCellElement;
-            const colSpan = parseInt(currentCell.getAttribute('colspan') || '1');
-
-            if (colSpan > 1) {
-                currentCell.setAttribute('colspan', (colSpan - 1).toString());
-                const newCell = currentCell.cloneNode(false) as HTMLTableCellElement;
-                newCell.removeAttribute('colspan');
-                newCell.innerHTML = '&nbsp;';
-                currentCell.parentElement?.insertBefore(newCell, currentCell.nextSibling);
-                handleInput();
-            }
-        }
-    },
-
-    // Table Styling
-    setTableStyle: (style: 'default' | 'bordered' | 'striped' | 'minimal') => {
-        const selection = window.getSelection();
-        if (!selection?.anchorNode) return;
-        const table = (selection.anchorNode as HTMLElement).closest?.('table') || (selection.anchorNode.parentElement as HTMLElement).closest('table');
-
-        if (table) {
-            table.removeAttribute('data-style');
-            table.setAttribute('data-style', style);
-
-            // Apply styles based on type
-            const cells = table.querySelectorAll('td, th');
-            cells.forEach((cell: Element) => {
-                const tdCell = cell as HTMLTableCellElement;
-                switch(style) {
-                    case 'bordered':
-                        tdCell.style.border = '2px solid ' + (darkMode ? '#555' : '#333');
-                        tdCell.style.padding = '8px';
-                        break;
-                    case 'striped':
-                        tdCell.style.border = '1px solid ' + (darkMode ? '#666' : '#ddd');
-                        tdCell.style.padding = '6px';
-                        break;
-                    case 'minimal':
-                        tdCell.style.border = 'none';
-                        tdCell.style.borderBottom = '1px solid ' + (darkMode ? '#666' : '#ddd');
-                        tdCell.style.padding = '8px';
-                        break;
-                    default:
-                        tdCell.style.border = '1px solid ' + (darkMode ? '#666' : '#ccc');
-                        tdCell.style.padding = '4px';
-                }
-            });
-
-            // Add striped rows for striped style
-            if (style === 'striped') {
-                Array.from(table.rows).forEach((row, index) => {
-                    if (index % 2 === 1) {
-                        row.style.backgroundColor = darkMode ? '#2a2a2a' : '#f9f9f9';
-                    } else {
-                        row.style.backgroundColor = '';
-                    }
-                });
-            }
-
-            handleInput();
-        }
-    },
-
-    // Column Width
-    setColumnWidth: (width: string) => {
-        const selection = window.getSelection();
-        if (!selection?.anchorNode) return;
-        const cell = (selection.anchorNode as HTMLElement).closest?.('td, th') || (selection.anchorNode.parentElement as HTMLElement).closest('td, th');
-
-        if (cell) {
-            const cellIndex = (cell as HTMLTableCellElement).cellIndex;
-            const table = (cell as HTMLElement).closest('table');
-
-            if (table) {
-                Array.from(table.rows).forEach(row => {
-                    if (row.cells[cellIndex]) {
-                        row.cells[cellIndex].style.width = width;
-                    }
-                });
-                handleInput();
-            }
-        }
-    },
-
-    // Image Methods
-    resizeImage: (percent: number) => {
-        if (selectedImage) {
-            selectedImage.style.width = `${percent}%`;
-            selectedImage.style.height = 'auto';
-            handleInput();
-            // Force re-select to update UI
-            setSelectedImage(selectedImage);
-        }
-    },
-    alignImage: (align: 'left' | 'center' | 'right') => {
-        if(selectedImage) {
-            const div = document.createElement('div');
-            div.style.textAlign = align;
-            selectedImage.parentElement?.insertBefore(div, selectedImage);
-            div.appendChild(selectedImage);
-            handleInput();
-        }
-    },
-
-    rotateImage: (degrees: number) => {
-        if (selectedImage) {
-            const currentRotation = selectedImage.getAttribute('data-rotation') || '0';
-            const newRotation = (parseInt(currentRotation) + degrees) % 360;
-            selectedImage.setAttribute('data-rotation', newRotation.toString());
-            selectedImage.style.transform = `rotate(${newRotation}deg)`;
-            handleInput();
-            setSelectedImage(selectedImage);
-        }
-    },
-
-    setImageBorder: (style: 'none' | 'thin' | 'medium' | 'thick' | 'rounded') => {
-        if (selectedImage) {
-            switch(style) {
-                case 'none':
-                    selectedImage.style.border = 'none';
-                    selectedImage.style.borderRadius = '0';
-                    break;
-                case 'thin':
-                    selectedImage.style.border = '1px solid ' + (darkMode ? '#666' : '#ccc');
-                    selectedImage.style.borderRadius = '0';
-                    selectedImage.style.padding = '2px';
-                    break;
-                case 'medium':
-                    selectedImage.style.border = '3px solid ' + (darkMode ? '#555' : '#999');
-                    selectedImage.style.borderRadius = '0';
-                    selectedImage.style.padding = '4px';
-                    break;
-                case 'thick':
-                    selectedImage.style.border = '6px solid ' + (darkMode ? '#444' : '#666');
-                    selectedImage.style.borderRadius = '0';
-                    selectedImage.style.padding = '6px';
-                    break;
-                case 'rounded':
-                    selectedImage.style.border = '2px solid ' + (darkMode ? '#555' : '#999');
-                    selectedImage.style.borderRadius = '12px';
-                    selectedImage.style.padding = '4px';
-                    break;
-            }
-            handleInput();
-            setSelectedImage(selectedImage);
-        }
-    },
-
-    replaceImage: async (newDataUrl: string) => {
-        if (selectedImage) {
-            selectedImage.src = newDataUrl;
-            handleInput();
-            setSelectedImage(selectedImage);
-        }
-    },
-
-    getSelectedImage: () => selectedImage
-  }));
-
-  const repaginateEditor = () => {
-    requestAnimationFrame(() => {
-      const editor = contentRef.current;
-      if (!editor) return;
-
-      const blocks = Array.from(editor.children) as HTMLElement[];
-      if (blocks.length === 0) return;
-
-      // Reset previous margins
-      blocks.forEach(block => {
-        block.style.marginTop = '';
-      });
-
-      // Force synchronous layout reflow to read clean offsetHeights
-      const _reflow = editor.offsetHeight;
-
-      const parsedHeight = parseFloat(PAGE_SIZES[size].height);
-      const isMm = PAGE_SIZES[size].height.includes('mm');
-      const scaleFactor = isMm ? 3.7795 : 96;
-      let totalPageHeight = parsedHeight * scaleFactor;
-      if (orientation === 'landscape') {
-        const parsedWidth = parseFloat(PAGE_SIZES[size].width);
-        totalPageHeight = parsedWidth * scaleFactor;
-      }
-
-      const parsedPadding = parseFloat(PAGE_MARGINS[margin]);
-      const paddingIsCm = PAGE_MARGINS[margin].includes('cm');
-      const paddingScale = paddingIsCm ? (96 / 2.54) : 96;
-      const paddingPx = parsedPadding * paddingScale;
-
-      const printableHeight = totalPageHeight - (paddingPx * 2);
-
-      let currentHeight = 0;
-      blocks.forEach(block => {
-        const blockHeight = block.offsetHeight;
-        if (currentHeight + blockHeight > printableHeight) {
-          const remainingSpace = printableHeight - currentHeight;
-          block.style.marginTop = `${remainingSpace + (paddingPx * 2) + 24}px`;
-          currentHeight = blockHeight;
-        } else {
-          currentHeight += blockHeight;
-        }
-      });
-    });
-  };
-
-  useEffect(() => {
-    if (contentRef.current && contentRef.current.innerHTML !== content && !isInternalUpdate.current) {
-      contentRef.current.innerHTML = content;
-      repaginateEditor();
-    }
-    isInternalUpdate.current = false;
-  }, [content]);
-
-  useEffect(() => {
-    repaginateEditor();
-  }, [pageConfig]);
-
-  // --- Event Handlers ---
-
-  const handleInput = () => {
-    if (contentRef.current) {
-      isInternalUpdate.current = true;
-      repaginateEditor();
-      onChange(contentRef.current.innerHTML, contentRef.current.innerText);
-    }
-  };
-
-  const handlePaste = (e: React.ClipboardEvent) => {
-    if (pasteAsPlainText) {
-      e.preventDefault();
-      const text = e.clipboardData.getData('text/plain');
-      document.execCommand('insertText', false, text);
-      repaginateEditor();
-    }
-  };
-
-  const handleSelectionChange = () => {
-      const selection = window.getSelection();
-      if (!selection || !selection.anchorNode || !contentRef.current?.contains(selection.anchorNode)) {
-          return;
-      }
-
-      let node = selection.anchorNode as HTMLElement;
-      if (node.nodeType === 3) node = node.parentElement as HTMLElement; // Text node -> Element
-
-      // Detect Table
-      const table = node.closest('table');
-      if (table) {
-          onContextChange({ type: 'table' });
-          clearImageSelection();
-          return;
-      }
-
-      // Default - read document selection styles
-      let align: 'left' | 'center' | 'right' | 'justify' = 'left';
-      if (document.queryCommandState('justifyCenter')) align = 'center';
-      else if (document.queryCommandState('justifyRight')) align = 'right';
-      else if (document.queryCommandState('justifyFull')) align = 'justify';
-
-      let formatBlock = 'div';
-      try {
-        formatBlock = document.queryCommandValue('formatBlock') || 'div';
-      } catch (e) {}
-
-      // Get paragraph shading (custom paragraph background) by looking up parents
-      let paragraphBackground = '';
-      let currentEl = node;
-      while (currentEl && currentEl !== contentRef.current) {
-        if (currentEl.style?.backgroundColor) {
-          paragraphBackground = currentEl.style.backgroundColor;
-          break;
-        }
-        currentEl = currentEl.parentElement as HTMLElement;
-      }
-
-      let fontName = 'Arial';
-      let fontSize = '11';
-      if (node) {
-        try {
-          const style = window.getComputedStyle(node);
-          if (style.fontFamily) {
-            fontName = style.fontFamily.split(',')[0].replace(/['"]/g, '').trim();
+  const editor = useEditor(
+    {
+      extensions,
+      content: initialContent,
+      parseOptions: parseOptionsFor(initialContent || ''),
+      shouldRerenderOnTransaction: false,
+      immediatelyRender: true,
+      editorProps: {
+        attributes: {
+          class: 'penko-prosemirror outline-none',
+          role: 'textbox',
+          'aria-label': t(uiLanguage, 'documentEditor'),
+          'aria-multiline': 'true',
+          // Document text direction follows its content, not the UI language (RTL UI for Arabic).
+          dir: 'auto',
+        },
+        // Keep the caret clear of the sticky ruler / floating status bar when scrolling
+        scrollMargin: { top: 56, bottom: 96, left: 0, right: 0 },
+        scrollThreshold: { top: 56, bottom: 96, left: 0, right: 0 },
+        transformPastedHTML: html => prepareHtmlForEditor(html),
+        handlePaste: (view, event) => {
+          const files = Array.from(event.clipboardData?.files || []).filter(f => f.type.startsWith('image/'));
+          if (files.length) {
+            void insertFilesRef.current(files);
+            return true;
           }
-          if (style.fontSize) {
-            const sizeStr = style.fontSize;
-            if (sizeStr.includes('px')) {
-              const px = parseFloat(sizeStr);
-              fontSize = Math.round(px * 0.75).toString();
-            } else if (sizeStr.includes('pt')) {
-              fontSize = Math.round(parseFloat(sizeStr)).toString();
-            }
+          if (pasteRef.current) {
+            const text = event.clipboardData?.getData('text/plain') || '';
+            view.dispatch(view.state.tr.insertText(text));
+            return true;
           }
-        } catch (e) {}
-      }
+          return false;
+        },
+        handleDrop: (view, event, _slice, moved) => {
+          if (moved) return false;
+          const files = Array.from(event.dataTransfer?.files || []).filter(f => f.type.startsWith('image/'));
+          if (!files.length) return false;
+          event.preventDefault();
+          const coords = view.posAtCoords({ left: event.clientX, top: event.clientY });
+          if (coords) view.dispatch(view.state.tr.setSelection((view.state.selection.constructor as any).near(view.state.doc.resolve(coords.pos))));
+          void insertFilesRef.current(files);
+          return true;
+        },
+      },
+      onCreate: ({ editor: ed }) => {
+        migrateLegacyFootnotes(ed, doc);
+        ed.commands.setReferenceData({ citations: doc.citations || [], tocTitle: t(uiLanguage, 'tableOfContents'), tocEmpty: t(uiLanguage, 'noHeadingsFoundInDoc') });
+      },
+      onUpdate: () => {
+        dirty.current = true;
+        window.clearTimeout(commitTimer.current);
+        // Serialising a long document is the expensive part of saving: do it when the browser is idle
+        commitTimer.current = window.setTimeout(() => {
+          if ('requestIdleCallback' in window) (window as any).requestIdleCallback(() => commitRef.current(), { timeout: 700 });
+          else commitRef.current();
+        }, COMMIT_DEBOUNCE_MS);
+      },
+      onSelectionUpdate: ({ editor: ed }) => scheduleSelection(ed),
+      onTransaction: ({ editor: ed, transaction }) => {
+        if (transaction.docChanged) scheduleSelection(ed);
+      },
+      onDestroy: () => {
+        // flush happens through commitRef in the cleanup below
+      },
+    },
+    [doc.id, collab?.document],
+  );
 
-      let foreColor = '';
-      try {
-        foreColor = document.queryCommandValue('foreColor') || '';
-      } catch (e) {}
-
-      let hiliteColor = '';
-      try {
-        hiliteColor = document.queryCommandValue('backColor') || document.queryCommandValue('hiliteColor') || '';
-      } catch (e) {}
-
-      onContextChange({
-          type: 'text',
-          bold: document.queryCommandState('bold'),
-          italic: document.queryCommandState('italic'),
-          underline: document.queryCommandState('underline'),
-          strikeThrough: document.queryCommandState('strikeThrough') || document.queryCommandState('strikethrough'),
-          subscript: document.queryCommandState('subscript'),
-          superscript: document.queryCommandState('superscript'),
-          fontName,
-          fontSize,
-          foreColor,
-          hiliteColor,
-          paragraphBackground,
-          align,
-          formatBlock
+  // Function declaration (hoisted): collaborative editors can emit transactions during construction
+  function scheduleSelection(ed: TiptapEditor) {
+    if (selectionFrame.current) cancelAnimationFrame(selectionFrame.current);
+    selectionFrame.current = requestAnimationFrame(() => {
+      selectionFrame.current = 0;
+      if (ed.isDestroyed) return;
+      const ctx = computeSelectionContext(ed);
+      setSelectionContext(ctx);
+      setPageInfo(info => {
+        const current = pageAtPos(ed.state, ed.state.selection.from);
+        return info.current === current ? info : { ...info, current };
       });
-  };
-
-  const handleClick = (e: React.MouseEvent) => {
-      const target = e.target as HTMLElement;
-      
-      // Image Selection Logic
-      if (target.tagName === 'IMG') {
-          // Deselect previous
-          if (selectedImage && selectedImage !== target) {
-             selectedImage.classList.remove('selected-img');
-             removeResizeHandles(selectedImage);
-          }
-
-          const img = target as HTMLImageElement;
-          img.classList.add('selected-img');
-          addResizeHandles(img);
-          setSelectedImage(img);
-          onContextChange({ type: 'image', data: { src: img.src } });
-          e.stopPropagation(); // Prevent text selection clearing logic immediately
-          return;
+      const sel: any = ed.state.selection;
+      if (sel.node?.type?.name === 'image') {
+        setSelectedImage({ pos: sel.from, attrs: sel.node.attrs, dom: (ed.view.nodeDOM(sel.from) as HTMLElement) || null });
       } else {
-          clearImageSelection();
+        setSelectedImage(null);
       }
+    });
+  }
 
-      handleSelectionChange();
+  // Commit editor content to the document store (debounced; flushed on switch/unload)
+  commitRef.current = () => {
+    window.clearTimeout(commitTimer.current);
+    if (!editor || editor.isDestroyed || !dirty.current) return;
+    dirty.current = false;
+    const html = editor.getHTML();
+    updateCurrentDoc(d => (d.id === doc.id ? { content: html } : {}));
+    setNotes(collectNotes(editor));
+    setStats(statsOf(editor));
   };
 
-  const clearImageSelection = () => {
-      if (selectedImage) {
-          selectedImage.classList.remove('selected-img');
-          removeResizeHandles(selectedImage);
-          setSelectedImage(null);
-      }
-  };
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    setActiveEditor(editor);
+    registerEditorFlush(() => commitRef.current());
+    setNotes(collectNotes(editor));
+    setStats(statsOf(editor));
+    // Handy for debugging and end-to-end tests (dev builds only)
+    if (import.meta.env.DEV) (window as any).__penkoEditor = editor;
+    const onFootnote = ({ pos, node }: any) => {
+      if (typeof pos !== 'number') return;
+      setEditingFootnote({ pos, content: node.attrs.content, noteType: node.attrs.noteType });
+      setShowFootnoteDialog(true);
+    };
+    const onEquation = ({ pos, node }: any) => {
+      if (typeof pos !== 'number') return;
+      setEditingEquation({ pos, latex: node.attrs.latex, display: node.attrs.display });
+      setShowEquationDialog(true);
+    };
+    editor.on('penko:editFootnote' as any, onFootnote);
+    editor.on('penko:editEquation' as any, onEquation);
+    return () => {
+      commitRef.current();
+      editor.off('penko:editFootnote' as any, onFootnote);
+      editor.off('penko:editEquation' as any, onEquation);
+      registerEditorFlush(null);
+      setActiveEditor(null);
+      if (selectionFrame.current) cancelAnimationFrame(selectionFrame.current);
+    };
+  }, [editor]);
 
-  // Add resize handles to image
-  const addResizeHandles = (img: HTMLImageElement) => {
-    // Remove any existing handles first
-    removeResizeHandles(img);
+  // Content replaced from outside the editor (restore version, markdown, focus mode…)
+  const lastRevision = useRef(contentRevision);
+  useEffect(() => {
+    if (!editor || editor.isDestroyed || contentRevision === lastRevision.current) return;
+    lastRevision.current = contentRevision;
+    if (collab) return;
+    dirty.current = false;
+    const html = prepareHtmlForEditor(doc.content);
+    editor.commands.setContent(html, { emitUpdate: false, parseOptions: parseOptionsFor(html) });
+    migrateLegacyFootnotes(editor, doc);
+    setNotes(collectNotes(editor));
+    setStats(statsOf(editor));
+  }, [contentRevision, editor]);
 
-    // Wrap image in a container if not already wrapped
-    let wrapper = img.parentElement;
-    if (!wrapper || !wrapper.classList.contains('img-resize-wrapper')) {
-      wrapper = document.createElement('div');
-      wrapper.className = 'img-resize-wrapper';
-      wrapper.style.position = 'relative';
-      wrapper.style.display = 'inline-block';
-      wrapper.style.lineHeight = '0';
-      img.parentElement?.insertBefore(wrapper, img);
-      wrapper.appendChild(img);
-    }
+  // Screenplay mode + labels
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    (editor.storage as any).screenplay.enabled = !!doc.isScreenplay;
+  }, [editor, doc.isScreenplay]);
 
-    // Create 8 resize handles (4 corners + 4 edges)
-    const handles = ['nw', 'ne', 'sw', 'se', 'n', 's', 'w', 'e'];
-    handles.forEach(pos => {
-      const handle = document.createElement('div');
-      handle.className = `img-resize-handle img-resize-${pos}`;
-      handle.setAttribute('data-handle', pos);
-      handle.addEventListener('mousedown', (e) => handleResizeStart(e, img, pos));
-      wrapper!.appendChild(handle);
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    editor.commands.setReferenceData({ tocTitle: t(uiLanguage, 'tableOfContents'), tocEmpty: t(uiLanguage, 'noHeadingsFoundInDoc') });
+  }, [editor, uiLanguage]);
+
+  // Paint format: apply to the next selection made with the mouse
+  const paintRef = useRef(isPaintingFormat);
+  paintRef.current = isPaintingFormat;
+  const handleMouseUp = () => {
+    if (!paintRef.current || !editor) return;
+    requestAnimationFrame(() => {
+      if (!editor.state.selection.empty) applyPaintFormat();
     });
   };
 
-  // Remove resize handles from image
-  const removeResizeHandles = (img: HTMLImageElement) => {
-    const wrapper = img.parentElement;
-    if (wrapper && wrapper.classList.contains('img-resize-wrapper')) {
-      const handles = wrapper.querySelectorAll('.img-resize-handle');
-      handles.forEach(handle => handle.remove());
-    }
-  };
-
-  // Handle resize start
-  const handleResizeStart = (e: MouseEvent, img: HTMLImageElement, handle: string) => {
-    e.preventDefault();
-    e.stopPropagation();
-
-    const startX = e.clientX;
-    const startY = e.clientY;
-    const startWidth = img.offsetWidth;
-    const startHeight = img.offsetHeight;
-    const aspectRatio = startWidth / startHeight;
-    const maintainAspect = img.getAttribute('data-aspect-locked') !== 'false';
-
-    const handleMouseMove = (moveEvent: MouseEvent) => {
-      const deltaX = moveEvent.clientX - startX;
-      const deltaY = moveEvent.clientY - startY;
-
-      let newWidth = startWidth;
-      let newHeight = startHeight;
-
-      // Calculate new dimensions based on handle
-      if (handle.includes('e')) newWidth = startWidth + deltaX;
-      if (handle.includes('w')) newWidth = startWidth - deltaX;
-      if (handle.includes('s')) newHeight = startHeight + deltaY;
-      if (handle.includes('n')) newHeight = startHeight - deltaY;
-
-      // Maintain aspect ratio for corner handles or if locked
-      if (maintainAspect || handle.length === 2) {
-        if (handle.includes('e') || handle.includes('w')) {
-          newHeight = newWidth / aspectRatio;
-        } else {
-          newWidth = newHeight * aspectRatio;
-        }
-      }
-
-      // Apply minimum size
-      newWidth = Math.max(50, newWidth);
-      newHeight = Math.max(50, newHeight);
-
-      img.style.width = newWidth + 'px';
-      img.style.height = newHeight + 'px';
-    };
-
-    const handleMouseUp = () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
-      handleInput(); // Save changes
-    };
-
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
-  };
-
-  const handleKeyUp = () => {
-      handleSelectionChange();
-  };
-
-  // --- Drag and Drop Image Upload ---
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-  };
-
-  const handleDrop = async (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-
-    const files = Array.from(e.dataTransfer.files);
-    const imageFiles = files.filter(file => file.type.startsWith('image/'));
-
-    if (imageFiles.length === 0) return;
-
-    // Process each image
-    for (const file of imageFiles) {
-      const reader = new FileReader();
-      reader.onload = async (event) => {
-        if (event.target?.result) {
-          let dataUrl = event.target.result as string;
-
-          // Auto-optimize if file is >1MB
-          const fileSizeKB = (dataUrl.length * 0.75) / 1024;
-          if (fileSizeKB > 1024) {
-            try {
-              // Import compression function
-              const { compressImage, shouldCompressImage } = await import('../utils/imageUtils');
-              if (shouldCompressImage(dataUrl)) {
-                dataUrl = await compressImage(dataUrl);
-              }
-            } catch (error) {
-              console.error('Failed to compress image:', error);
-            }
-          }
-
-          // Insert the image at cursor position
-          document.execCommand('insertImage', false, dataUrl);
-          handleInput();
-        }
-      };
-      reader.readAsDataURL(file);
-    }
-  };
-
-  // --- Layout Logic ---
+  // --- Layout (unchanged look) ---
+  const pageConfig = doc.pageConfig;
   const size = pageConfig?.size || 'A4';
   const orientation = pageConfig?.orientation || 'portrait';
   const margin = pageConfig?.margins || 'normal';
@@ -620,94 +300,227 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(({ content, onChange
 
   let width = PAGE_SIZES[size].width;
   let height = PAGE_SIZES[size].height;
-  if (orientation === 'landscape') {
-      [width, height] = [height, width];
-  }
+  if (orientation === 'landscape') [width, height] = [height, width];
   const padding = PAGE_MARGINS[margin];
 
-  // Helper function to replace {PAGE} placeholders with actual page numbers (for display)
-  const renderHeaderFooterContent = (htmlContent: string, currentPage: number = 1) => {
-    if (!htmlContent) return '';
-    return htmlContent.replace(/\{PAGE\}/g, currentPage.toString());
+  const pageHeightPx = cssLengthToPx(height);
+  const paddingPx = cssLengthToPx(padding);
+
+  const paginated = cols === 1 && !fitWidth;
+  const pageWidthPx = cssLengthToPx(width);
+  const PAGE_GAP = 24;
+  const [pageCount, setPageCount] = useState(1);
+  const [lastPageNotes, setLastPageNotes] = useState<PageNote[]>([]);
+  // Pages in the other orientation (sections), as a '0101…' string per page
+  const [pageAltSig, setPageAltSig] = useState('');
+
+  // Header/footer content for every page (also used by the page boundaries)
+  const chromeDoc = useMemo(
+    () => ({
+      header: doc.header,
+      footer: doc.footer,
+      showPageNumbers: doc.showPageNumbers,
+      pageNumberPosition: doc.pageNumberPosition,
+      differentFirstPage: doc.differentFirstPage,
+      pageNumberFormat: doc.pageNumberFormat,
+    }),
+    [doc.header, doc.footer, doc.showPageNumbers, doc.pageNumberPosition, doc.differentFirstPage, doc.pageNumberFormat],
+  );
+  const pageOfLabel = t(uiLanguage, 'pageXofY');
+  // Set after each layout so the first header / last footer re-render when sections change
+  const [, setSectionsSig] = useState('');
+
+  /** Header/footer HTML for a page, using the settings of the section it belongs to. */
+  const zoneFor = (kind: 'header' | 'footer', page: number, total: number) => {
+    const sections: SectionInfo[] = (editor?.storage as any)?.pagination?.sections || [];
+    const sec = sectionOfPage(page, sections);
+    const settings = resolveSection(chromeDoc, sections.filter(x => x.index > 0).map(x => x.settings), sec?.index ?? 0);
+    return zoneHtml(settings, kind, page, total, { pageOfLabel, displayPage: displayPageNumber(page, sections), firstOfSection: sec ? sec.firstPage === page : page === 1 });
+  };
+  const zoneForRef = useRef(zoneFor);
+  zoneForRef.current = zoneFor;
+
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    editor.commands.setPagination({
+      enabled: paginated,
+      pageHeight: pageHeightPx,
+      pageWidth: pageWidthPx,
+      orientation,
+      margin: paddingPx,
+      gap: PAGE_GAP,
+      renderZone: (kind, page, total) => {
+        const html = zoneForRef.current(kind, page, total);
+        if (!html) return null;
+        const el = document.createElement('div');
+        el.className = 'penko-zone';
+        el.innerHTML = html;
+        return el;
+      },
+      onLayout: (total, lastNotes) => {
+        setPageCount(total);
+        setSectionsSig((editor.storage as any).pagination?.sectionsSig || '');
+        const alt: boolean[] = (editor.storage as any).pagination?.pageAlt || [];
+        setPageAltSig(alt.some(Boolean) ? alt.map(a => (a ? 1 : 0)).join('') : '');
+        setLastPageNotes(prev =>
+          prev.length === lastNotes.length && prev.every((n, i) => n.pos === lastNotes[i].pos && n.label === lastNotes[i].label && n.content === lastNotes[i].content) ? prev : lastNotes,
+        );
+        setPageInfo(info => {
+          const current = Math.min(pageAtPos(editor.state, editor.state.selection.from), total);
+          return info.total === total && info.current === current ? info : { current, total };
+        });
+      },
+    });
+  }, [editor, paginated, pageHeightPx, pageWidthPx, orientation, paddingPx, chromeDoc, pageOfLabel]);
+
+  // Non-paginated layouts (columns, mobile) keep the single header/footer band
+  const header = useMemo(() => sanitizeHtml(doc.header || ''), [doc.header]);
+  const footer = useMemo(() => sanitizeHtml(doc.footer || ''), [doc.footer]);
+  const { showPageNumbers, pageNumberPosition } = doc;
+  const renderHF = (html: string) => html.replace(/\{PAGE\}/g, '1').replace(/\{PAGES\}/g, '1');
+
+  const firstHeader = paginated ? zoneFor('header', 1, pageCount) : '';
+  const lastFooter = paginated ? zoneFor('footer', pageCount, pageCount) : '';
+  const pageBg = pageConfig?.backgroundColor || (darkMode ? '#1f1f1f' : '#ffffff');
+  const canvas = darkMode ? '#0f0f0f' : '#f8fafc';
+
+  // Mixed orientations: page positions and the sheets drawn behind pages of the other orientation
+  const geometry = { pageWidth: pageWidthPx, pageHeight: pageHeightPx, gap: PAGE_GAP };
+  const pageAlt = paginated && pageAltSig.length === pageCount ? Array.from(pageAltSig, c => c === '1') : null;
+  const layoutTops = pageAlt ? pageTops(geometry, pageAlt) : null;
+  const firstFrame = pageFrame(geometry, !!pageAlt?.[0]);
+  const lastFrame = pageFrame(geometry, !!pageAlt?.[pageCount - 1]);
+  const frameStyle = (f: { left: number; width: number }) => ({ left: f.left, width: f.width });
+
+  // Clicking a footnote in a page's notes area opens it for editing
+  const onPageClick = (e: React.MouseEvent) => {
+    const item = (e.target as HTMLElement).closest<HTMLElement>('[data-note-pos]');
+    if (!item || !editor) return;
+    const pos = Number(item.dataset.notePos);
+    const node = editor.state.doc.nodeAt(pos);
+    if (node?.type.name !== 'footnote') return;
+    setEditingFootnote({ pos, content: node.attrs.content, noteType: node.attrs.noteType });
+    setShowFootnoteDialog(true);
+  };
+  const lastNotesHtml = useMemo(() => (lastPageNotes.length ? buildNotes('div', lastPageNotes).outerHTML : ''), [lastPageNotes]);
+
+  // Double-clicking a page's header/footer area edits the header/footer of that page's section
+  const onChromeDoubleClick = (e: React.MouseEvent) => {
+    const target = e.target as HTMLElement;
+    const zone = target.closest<HTMLElement>('.penko-page-header-zone, .penko-page-footer-zone, .penko-first-header, .penko-last-footer');
+    if (!zone) return;
+    let page = 1;
+    if (zone.classList.contains('penko-last-footer')) page = pageCount;
+    else if (!zone.classList.contains('penko-first-header')) {
+      const endsPage = Number(zone.closest<HTMLElement>('.penko-page-boundary')?.dataset.page || 1);
+      page = zone.classList.contains('penko-page-header-zone') ? endsPage + 1 : endsPage;
+    }
+    openHeaderFooter({ page });
+  };
+
+  // Paginated: footnotes are drawn at the bottom of each page by the layout
+  const footnotes = paginated ? [] : notes.filter(n => n.noteType === 'footnote');
+  const endnotes = notes.filter(n => n.noteType === 'endnote');
+
+  const openNote = (n: NoteItem) => {
+    setEditingFootnote({ pos: n.pos, content: n.content, noteType: n.noteType });
+    setShowFootnoteDialog(true);
   };
 
   return (
     <div
-      className="transition-transform origin-top duration-200 ease-out flex flex-col items-center pb-20 print:transform-none print:pb-0 print:items-start"
-      style={{ transform: `scale(${zoom / 100})` }}
+      className="transition-transform origin-top duration-200 ease-out flex flex-col items-center [align-items:safe_center] pb-20 print:transform-none print:pb-0 print:items-start"
+      style={fitWidth ? { width: '100%' } : { transform: `scale(${zoom / 100})` }}
     >
       <div
-        className={`page-shadow relative transition-all duration-200 flex flex-col
+        className={`penko-page page-shadow relative transition-all duration-200 flex flex-col
            ${darkMode ? 'text-gray-200' : 'text-black'}
            print:bg-white print:text-black print:shadow-none print:w-full print:h-auto
         `}
+        data-paginated={paginated ? 'true' : 'false'}
+        data-page-width={pageWidthPx.toFixed(2)}
+        data-page-height={pageHeightPx.toFixed(2)}
+        data-page-count={pageCount}
+        data-page-margin={paddingPx.toFixed(2)}
+        data-page-background={pageConfig?.backgroundColor || '#ffffff'}
+        data-page-alt={pageAlt ? pageAltSig : undefined}
+        onDoubleClick={paginated ? onChromeDoubleClick : undefined}
+        onClick={paginated ? onPageClick : undefined}
         style={{
-          width: width,
-          minHeight: height,
-          backgroundColor: pageConfig?.backgroundColor || (darkMode ? '#1f1f1f' : '#ffffff'),
+          width: fitWidth ? '100%' : width,
+          minHeight: fitWidth ? '60vh' : layoutTops ? layoutTops.total : paginated ? pageCount * pageHeightPx + (pageCount - 1) * PAGE_GAP : height,
+          isolation: 'isolate',
+          backgroundColor: pageBg,
+          ['--penko-page-bg' as any]: pageBg,
+          ['--penko-page-margin' as any]: `${paddingPx}px`,
+          ['--penko-canvas' as any]: canvas,
         }}
       >
-        {/* Header */}
-        {(header || (showPageNumbers && pageNumberPosition?.startsWith('header'))) && (
+        {pageAlt &&
+          layoutTops &&
+          pageAlt.map((alt, i) => {
+            if (!alt) return null;
+            const f = pageFrame(geometry, true);
+            const top = layoutTops.tops[i];
+            return (
+              <React.Fragment key={i}>
+                {/* narrower than the page element: hide its background beside the page */}
+                {f.left > 0 && <div className="penko-alt-canvas" style={{ position: 'absolute', zIndex: -1, top, height: f.height, left: 0, right: 0, background: canvas }} />}
+                <div className="penko-alt-sheet page-shadow" style={{ position: 'absolute', zIndex: -1, top, height: f.height, left: f.left, width: f.width, background: pageBg }} />
+              </React.Fragment>
+            );
+          })}
+        {paginated && (
+          <div
+            className="penko-first-header penko-page-header-zone-static"
+            style={{ position: 'absolute', top: 0, ...frameStyle(firstFrame), height: paddingPx }}
+            title={t(uiLanguage, 'doubleClickToEditHeader')}
+            dangerouslySetInnerHTML={{ __html: firstHeader ? `<div class="penko-zone">${firstHeader}</div>` : '' }}
+          />
+        )}
+        {paginated && lastNotesHtml && (
+          <div
+            className="penko-last-notes"
+            style={{ position: 'absolute', bottom: paddingPx, ...frameStyle(lastFrame) }}
+            dangerouslySetInnerHTML={{ __html: lastNotesHtml }}
+          />
+        )}
+        {paginated && (
+          <div
+            className="penko-last-footer penko-page-footer-zone-static"
+            style={{ position: 'absolute', bottom: 0, ...frameStyle(lastFrame), height: paddingPx }}
+            title={t(uiLanguage, 'doubleClickToEditFooter')}
+            dangerouslySetInnerHTML={{ __html: lastFooter ? `<div class="penko-zone">${lastFooter}</div>` : '' }}
+          />
+        )}
+        {!paginated && (header || (showPageNumbers && pageNumberPosition?.startsWith('header'))) && (
           <div
             className={`print-header pt-4 pb-2 border-b ${darkMode ? 'border-gray-700' : 'border-gray-200'} print:border-gray-300`}
-            style={{
-              fontSize: '10pt',
-              minHeight: '40px',
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              paddingLeft: padding,
-              paddingRight: padding
-            }}
+            style={{ fontSize: '10pt', minHeight: '40px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingLeft: padding, paddingRight: padding }}
           >
+            <div style={{ flex: 1, textAlign: 'left' }}>{pageNumberPosition === 'header-left' && showPageNumbers ? '1' : ''}</div>
             <div
-              dangerouslySetInnerHTML={{ __html: renderHeaderFooterContent(
-                pageNumberPosition === 'header-left' && showPageNumbers ? '{PAGE}' : '',
-                1
-              )}}
-              style={{ flex: 1, textAlign: 'left' }}
-            />
-            <div
-              dangerouslySetInnerHTML={{ __html: renderHeaderFooterContent(
-                header || (pageNumberPosition === 'header-center' && showPageNumbers ? '{PAGE}' : ''),
-                1
-              )}}
               style={{ flex: 1, textAlign: 'center' }}
+              dangerouslySetInnerHTML={{ __html: renderHF(header || (pageNumberPosition === 'header-center' && showPageNumbers ? '{PAGE}' : '')) }}
             />
-            <div
-              dangerouslySetInnerHTML={{ __html: renderHeaderFooterContent(
-                pageNumberPosition === 'header-right' && showPageNumbers ? '{PAGE}' : '',
-                1
-              )}}
-              style={{ flex: 1, textAlign: 'right' }}
-            />
+            <div style={{ flex: 1, textAlign: 'right' }}>{pageNumberPosition === 'header-right' && showPageNumbers ? '1' : ''}</div>
           </div>
         )}
 
-        {/* Main Content */}
-        <div
+        <EditorContent
+          editor={editor}
           id="editor-content"
-          ref={contentRef}
-          role="textbox"
-          aria-label="Document editor"
-          aria-multiline="true"
-          contentEditable
-          suppressContentEditableWarning
-          spellCheck={true}
-          lang={language}
-          onInput={handleInput}
-          onPaste={handlePaste}
-          onMouseUp={handleClick}
-          onKeyUp={handleKeyUp}
-          onBlur={clearImageSelection}
-          onDragOver={handleDragOver}
-          onDrop={handleDrop}
-          className={`outline-none flex-1 ${isPaintingFormat ? 'cursor-cell' : 'cursor-text'}`}
+          spellCheck
+          lang={doc.language || 'en-US'}
+          onMouseUp={handleMouseUp}
+          onClick={e => {
+            if (e.target === e.currentTarget && editor) editor.commands.focus('end');
+          }}
+          className={`penko-doc outline-none flex-1 ${isPaintingFormat ? 'cursor-cell' : 'cursor-text'} ${doc.isScreenplay ? 'screenplay-mode' : ''} ${darkMode ? 'penko-doc-dark' : ''}`}
           style={{
             boxSizing: 'border-box',
             width: '100%',
-            padding: padding,
+            padding: fitWidth ? '20px 16px' : padding,
             fontSize: '11pt',
             lineHeight: '1.15',
             fontFamily: '"Calibri", "Arial", sans-serif',
@@ -715,123 +528,60 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(({ content, onChange
             columnCount: cols > 1 ? cols : undefined,
             columnGap: cols > 1 ? '40px' : undefined,
             columnRule: cols > 1 ? '1px solid #e5e7eb' : undefined,
-            backgroundImage: `linear-gradient(to bottom, transparent calc(100% - 24px), ${darkMode ? '#0f0f0f' : '#f8fafc'} calc(100% - 24px), ${darkMode ? '#0f0f0f' : '#f8fafc'} calc(100% - 8px), ${darkMode ? '#3f3f46' : '#cbd5e1'} calc(100% - 8px), ${darkMode ? '#3f3f46' : '#cbd5e1'} 100%)`,
-            backgroundSize: `100% ${height}`,
+            ['--penko-canvas' as any]: darkMode ? '#0f0f0f' : '#f8fafc',
+            ['--penko-page-margin' as any]: `${paddingPx}px`,
           }}
         />
 
-        {/* Footer */}
-        {(footer || (showPageNumbers && pageNumberPosition?.startsWith('footer'))) && (
+        {(footnotes.length > 0 || endnotes.length > 0) && (
+          <div className="penko-notes" style={{ paddingLeft: padding, paddingRight: padding, paddingBottom: '24px', fontSize: '9pt' }}>
+            {footnotes.length > 0 && (
+              <div className={`pt-2 border-t ${darkMode ? 'border-gray-700' : 'border-gray-300'}`} style={{ width: '40%' }} />
+            )}
+            {footnotes.length > 0 && (
+              <ol className="penko-footnotes list-none p-0 m-0">
+                {footnotes.map(n => (
+                  <li key={`f-${n.pos}`} className="flex gap-1 cursor-pointer hover:underline" onClick={() => openNote(n)}>
+                    <sup>{noteLabel('footnote', n.number)}</sup>
+                    <span>{n.content}</span>
+                  </li>
+                ))}
+              </ol>
+            )}
+            {endnotes.length > 0 && (
+              <div className="mt-4">
+                <div className="font-bold mb-1" style={{ fontSize: '10pt' }}>{t(uiLanguage, 'endnotes')}</div>
+                <ol className="penko-endnotes list-none p-0 m-0">
+                  {endnotes.map(n => (
+                    <li key={`e-${n.pos}`} className="flex gap-1 cursor-pointer hover:underline" onClick={() => openNote(n)}>
+                      <sup>{noteLabel('endnote', n.number)}</sup>
+                      <span>{n.content}</span>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )}
+          </div>
+        )}
+
+        {!paginated && (footer || (showPageNumbers && pageNumberPosition?.startsWith('footer'))) && (
           <div
             className={`print-footer pb-4 pt-2 border-t ${darkMode ? 'border-gray-700' : 'border-gray-200'} print:border-gray-300`}
-            style={{
-              fontSize: '10pt',
-              minHeight: '40px',
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              paddingLeft: padding,
-              paddingRight: padding
-            }}
+            style={{ fontSize: '10pt', minHeight: '40px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingLeft: padding, paddingRight: padding }}
           >
+            <div style={{ flex: 1, textAlign: 'left' }}>{pageNumberPosition === 'footer-left' && showPageNumbers ? '1' : ''}</div>
             <div
-              dangerouslySetInnerHTML={{ __html: renderHeaderFooterContent(
-                pageNumberPosition === 'footer-left' && showPageNumbers ? '{PAGE}' : '',
-                1
-              )}}
-              style={{ flex: 1, textAlign: 'left' }}
-            />
-            <div
-              dangerouslySetInnerHTML={{ __html: renderHeaderFooterContent(
-                footer || (pageNumberPosition === 'footer-center' && showPageNumbers ? '{PAGE}' : ''),
-                1
-              )}}
               style={{ flex: 1, textAlign: 'center' }}
+              dangerouslySetInnerHTML={{ __html: renderHF(footer || (pageNumberPosition === 'footer-center' && showPageNumbers ? '{PAGE}' : '')) }}
             />
-            <div
-              dangerouslySetInnerHTML={{ __html: renderHeaderFooterContent(
-                pageNumberPosition === 'footer-right' && showPageNumbers ? '{PAGE}' : '',
-                1
-              )}}
-              style={{ flex: 1, textAlign: 'right' }}
-            />
+            <div style={{ flex: 1, textAlign: 'right' }}>{pageNumberPosition === 'footer-right' && showPageNumbers ? '1' : ''}</div>
           </div>
         )}
       </div>
-      
-      <div className={`text-xs mt-2 select-none print:hidden ${darkMode ? 'text-gray-600' : 'text-gray-400'}`}>
-         End of document
-      </div>
-      
-      <style>{`
-        #editor-content img { max-width: 100%; height: auto; cursor: pointer; }
-        #editor-content table { width: 100%; border-collapse: collapse; }
-        #editor-content td, #editor-content th { border: 1px solid ${darkMode ? '#666' : '#ccc'}; padding: 4px; min-width: 20px; }
-        ${darkMode ? `
-           #editor-content { color: #e5e5e5; }
-        ` : ''}
 
-        /* Selected Image Style */
-        .selected-img {
-            outline: 3px solid #3b82f6;
-            box-shadow: 0 0 0 1px white, 0 4px 6px rgba(0,0,0,0.3);
-            position: relative;
-        }
-
-        /* Image Resize Handles */
-        .img-resize-handle {
-            position: absolute;
-            background: white;
-            border: 2px solid #3b82f6;
-            width: 10px;
-            height: 10px;
-            z-index: 1000;
-        }
-
-        .img-resize-nw { top: -5px; left: -5px; cursor: nw-resize; }
-        .img-resize-ne { top: -5px; right: -5px; cursor: ne-resize; }
-        .img-resize-sw { bottom: -5px; left: -5px; cursor: sw-resize; }
-        .img-resize-se { bottom: -5px; right: -5px; cursor: se-resize; }
-        .img-resize-n { top: -5px; left: 50%; transform: translateX(-50%); cursor: n-resize; }
-        .img-resize-s { bottom: -5px; left: 50%; transform: translateX(-50%); cursor: s-resize; }
-        .img-resize-w { top: 50%; left: -5px; transform: translateY(-50%); cursor: w-resize; }
-        .img-resize-e { top: 50%; right: -5px; transform: translateY(-50%); cursor: e-resize; }
-
-        /* Spell Check Indicators */
-        #editor-content [spellcheck="true"]:focus::spelling-error,
-        #editor-content [spellcheck="true"]::spelling-error {
-            text-decoration: wavy underline #ef4444 2px;
-            text-decoration-skip-ink: none;
-        }
-
-        #editor-content [spellcheck="true"]:focus::grammar-error,
-        #editor-content [spellcheck="true"]::grammar-error {
-            text-decoration: wavy underline #3b82f6 2px;
-            text-decoration-skip-ink: none;
-        }
-
-        /* Comment Highlights */
-        .comment-highlight {
-            background-color: rgba(255, 193, 7, 0.3);
-            cursor: pointer;
-            transition: background-color 0.2s;
-        }
-
-        .comment-highlight:hover {
-            background-color: rgba(255, 193, 7, 0.5);
-        }
-
-        @keyframes flash {
-            0%, 100% { background-color: rgba(255, 193, 7, 0.3); }
-            50% { background-color: rgba(255, 193, 7, 0.8); }
-        }
-
-        .comment-flash {
-            animation: flash 1s ease-in-out;
-        }
-      `}</style>
+      <div className={`text-xs mt-2 select-none print:hidden ${darkMode ? 'text-gray-600' : 'text-gray-400'}`}>{t(uiLanguage, 'endOfDocumentMarker')}</div>
     </div>
   );
-});
+};
 
 Editor.displayName = 'Editor';

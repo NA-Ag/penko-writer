@@ -1,20 +1,17 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { X, Check, List, RefreshCw } from 'lucide-react';
 import { t, LanguageCode } from '../utils/translations';
+import { useApp } from '../AppContext';
+import { useFocusTrap } from '../utils/hooks';
+import { collectHeadings, buildTocInnerHtml, tocContainerStyle, TocStyle } from '../editor/toc';
+import { sanitizeHtml } from '../editor/sanitize';
 
 interface TableOfContentsDialogProps {
   isOpen: boolean;
   onClose: () => void;
-  onInsert: (html: string) => void;
+  onInsert: (opts: { style: TocStyle; levels: number[] }) => void;
   darkMode: boolean;
-  currentContent: string;
   uiLanguage: LanguageCode;
-}
-
-interface TOCEntry {
-  level: number;
-  text: string;
-  id: string;
 }
 
 const TableOfContentsDialog: React.FC<TableOfContentsDialogProps> = ({
@@ -22,110 +19,101 @@ const TableOfContentsDialog: React.FC<TableOfContentsDialogProps> = ({
   onClose,
   onInsert,
   darkMode,
-  currentContent,
   uiLanguage,
 }) => {
-  const [entries, setEntries] = useState<TOCEntry[]>([]);
-  const [style, setStyle] = useState<'default' | 'minimal' | 'numbered'>('default');
+  const { editor } = useApp();
+  const dialogRef = useFocusTrap<HTMLDivElement>(isOpen);
+  const [style, setStyle] = useState<TocStyle>('default');
   const [includeH1, setIncludeH1] = useState(true);
   const [includeH2, setIncludeH2] = useState(true);
   const [includeH3, setIncludeH3] = useState(true);
   const [includeH4, setIncludeH4] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  const levels = useMemo(
+    () => [includeH1 && 1, includeH2 && 2, includeH3 && 3, includeH4 && 4].filter(Boolean) as number[],
+    [includeH1, includeH2, includeH3, includeH4],
+  );
+
+  // Position of an existing TOC in the document (to update it instead of inserting a duplicate)
+  const findExistingToc = (): { pos: number; attrs: Record<string, any> } | null => {
+    if (!editor || editor.isDestroyed) return null;
+    let found: { pos: number; attrs: Record<string, any> } | null = null;
+    editor.state.doc.descendants((node, pos) => {
+      if (found) return false;
+      if (node.type.name === 'tableOfContents') {
+        found = { pos, attrs: node.attrs };
+        return false;
+      }
+      return true;
+    });
+    return found;
+  };
+  const existingToc = isOpen ? findExistingToc() : null;
+
+  // Pre-fill the options from an existing TOC when the dialog opens (defaults otherwise,
+  // so options from another document don't carry over)
+  useEffect(() => {
+    if (!isOpen) return;
+    const existing = findExistingToc();
+    const lv: number[] = existing?.attrs.levels || [1, 2, 3];
+    setStyle((existing?.attrs.tocStyle as TocStyle) || 'default');
+    setIncludeH1(lv.includes(1));
+    setIncludeH2(lv.includes(2));
+    setIncludeH3(lv.includes(3));
+    setIncludeH4(lv.includes(4));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
 
   useEffect(() => {
     if (!isOpen) return;
-    extractHeadings();
-  }, [isOpen, currentContent, includeH1, includeH2, includeH3, includeH4]);
-
-  const extractHeadings = () => {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(currentContent, 'text/html');
-    const headings: TOCEntry[] = [];
-
-    const selectors = [];
-    if (includeH1) selectors.push('h1');
-    if (includeH2) selectors.push('h2');
-    if (includeH3) selectors.push('h3');
-    if (includeH4) selectors.push('h4');
-
-    if (selectors.length === 0) {
-      setEntries([]);
-      return;
-    }
-
-    const elements = doc.querySelectorAll(selectors.join(', '));
-    elements.forEach((heading, index) => {
-      const level = parseInt(heading.tagName.substring(1));
-      const text = heading.textContent?.trim() || '';
-
-      // Generate or use existing ID
-      let id = heading.id;
-      if (!id) {
-        id = `toc-${text.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${index}`;
-        heading.id = id;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
       }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [isOpen, onClose]);
 
-      if (text) {
-        headings.push({ level, text, id });
-      }
-    });
+  const entries = useMemo(
+    () => (isOpen && editor && !editor.isDestroyed ? collectHeadings(editor.state.doc, levels) : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [isOpen, editor, levels, refreshKey],
+  );
 
-    setEntries(headings);
-  };
-
-  const generateTOC = () => {
-    if (entries.length === 0) {
-      return `<p><em>${t(uiLanguage, 'noHeadingsFoundInDoc')}</em></p>`;
-    }
-
-    let html = '<div class="table-of-contents" style="';
-
-    if (style === 'default') {
-      html += 'border: 2px solid #e5e7eb; padding: 20px; margin: 20px 0; border-radius: 8px; background: #f9fafb;';
-    } else if (style === 'minimal') {
-      html += 'border-left: 3px solid #3b82f6; padding-left: 20px; margin: 20px 0;';
-    } else {
-      html += 'padding: 20px; margin: 20px 0;';
-    }
-
-    html += '">';
-    html += `<h2 style="margin-top: 0; font-size: 1.5em; font-weight: bold; margin-bottom: 16px;">${t(uiLanguage, 'tableOfContents')}</h2>`;
-
-    if (style === 'numbered') {
-      html += '<ol style="list-style: decimal; padding-left: 20px;">';
-      entries.forEach(entry => {
-        const indent = (entry.level - 1) * 20;
-        html += `<li style="margin: 8px 0; padding-left: ${indent}px;">`;
-        html += `<a href="#${entry.id}" style="color: #3b82f6; text-decoration: none; hover: text-decoration: underline;">${entry.text}</a>`;
-        html += '</li>';
-      });
-      html += '</ol>';
-    } else {
-      html += '<ul style="list-style: none; padding: 0;">';
-      entries.forEach(entry => {
-        const indent = (entry.level - 1) * 20;
-        html += `<li style="margin: 8px 0; padding-left: ${indent}px;">`;
-        html += `<a href="#${entry.id}" style="color: #3b82f6; text-decoration: none;">${entry.text}</a>`;
-        html += '</li>';
-      });
-      html += '</ul>';
-    }
-
-    html += '</div>';
-    return html;
-  };
+  const previewHtml = useMemo(
+    () =>
+      sanitizeHtml(
+        `<div style="${tocContainerStyle(style)}">${buildTocInnerHtml(entries, style, t(uiLanguage, 'tableOfContents'), t(uiLanguage, 'noHeadingsFoundInDoc'))}</div>`,
+      ),
+    [entries, style, uiLanguage],
+  );
 
   const handleInsert = () => {
-    const tocHTML = generateTOC();
-    onInsert(tocHTML);
+    if (levels.length === 0) return;
+    const existing = findExistingToc();
+    if (existing && editor) {
+      editor
+        .chain()
+        .focus()
+        .command(({ tr }) => {
+          tr.setNodeMarkup(existing.pos, undefined, { ...existing.attrs, tocStyle: style, levels });
+          return true;
+        })
+        .run();
+    } else {
+      onInsert({ style, levels });
+    }
     onClose();
   };
 
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 backdrop-blur-sm p-4">
-      <div className={`
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 backdrop-blur-sm p-4" role="dialog" aria-modal="true" aria-labelledby="toc-dialog-title">
+      <div ref={dialogRef} className={`
         max-w-3xl w-full rounded-2xl shadow-2xl overflow-hidden
         ${darkMode ? 'bg-[#1e1e1e]' : 'bg-white'}
       `}>
@@ -133,6 +121,7 @@ const TableOfContentsDialog: React.FC<TableOfContentsDialogProps> = ({
         <div className="bg-gradient-to-r from-indigo-600 to-purple-600 p-6 text-white relative">
           <button
             onClick={onClose}
+            aria-label={t(uiLanguage, 'close')}
             className="absolute top-4 right-4 text-white/80 hover:text-white transition-colors"
           >
             <X className="w-6 h-6" />
@@ -143,7 +132,7 @@ const TableOfContentsDialog: React.FC<TableOfContentsDialogProps> = ({
               <List className="w-6 h-6" />
             </div>
             <div>
-              <h2 className="text-xl font-bold">{t(uiLanguage, 'tableOfContents')}</h2>
+              <h2 id="toc-dialog-title" className="text-xl font-bold">{t(uiLanguage, 'tableOfContents')}</h2>
               <p className="text-indigo-100 text-sm">{t(uiLanguage, 'autoGenerateFromHeadings')}</p>
             </div>
           </div>
@@ -245,7 +234,7 @@ const TableOfContentsDialog: React.FC<TableOfContentsDialogProps> = ({
                 {t(uiLanguage, 'preview')} ({entries.length} {t(uiLanguage, 'headingsFound')})
               </label>
               <button
-                onClick={extractHeadings}
+                onClick={() => setRefreshKey(k => k + 1)}
                 className={`
                   flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg transition-colors
                   ${darkMode
@@ -263,7 +252,7 @@ const TableOfContentsDialog: React.FC<TableOfContentsDialogProps> = ({
                 p-4 rounded-lg border max-h-60 overflow-y-auto
                 ${darkMode ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}
               `}
-              dangerouslySetInnerHTML={{ __html: generateTOC() }}
+              dangerouslySetInnerHTML={{ __html: previewHtml }}
             />
           </div>
 
@@ -298,17 +287,17 @@ const TableOfContentsDialog: React.FC<TableOfContentsDialogProps> = ({
           </button>
           <button
             onClick={handleInsert}
-            disabled={entries.length === 0}
+            disabled={levels.length === 0}
             className={`
               px-6 py-2.5 rounded-lg font-medium transition-colors flex items-center gap-2
-              ${entries.length === 0
+              ${levels.length === 0
                 ? 'bg-gray-400 cursor-not-allowed text-gray-200'
                 : 'bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white'
               }
             `}
           >
             <Check className="w-5 h-5" />
-            {t(uiLanguage, 'insertTOC')}
+            {existingToc ? t(uiLanguage, 'updateTOC') : t(uiLanguage, 'insertTOC')}
           </button>
         </div>
       </div>

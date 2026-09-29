@@ -1,20 +1,16 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { useApp } from '../AppContext';
+import { getSearchState } from '../editor/extensions/search';
+import type { Transaction } from '@tiptap/pm/state';
 import { X, Search, Replace, ChevronDown, ChevronUp, AlertCircle } from 'lucide-react';
 import { t, LanguageCode } from '../utils/translations';
+import { useEscapeKey } from '../utils/hooks';
 
 interface AdvancedFindReplaceProps {
   isOpen: boolean;
   onClose: () => void;
   darkMode: boolean;
   uiLanguage: LanguageCode;
-  editorRef: React.RefObject<HTMLDivElement>;
-}
-
-interface Match {
-  node: Text;
-  offset: number;
-  length: number;
-  text: string;
 }
 
 export const AdvancedFindReplace: React.FC<AdvancedFindReplaceProps> = ({
@@ -22,301 +18,75 @@ export const AdvancedFindReplace: React.FC<AdvancedFindReplaceProps> = ({
   onClose,
   darkMode,
   uiLanguage,
-  editorRef
 }) => {
+  const { editor } = useApp();
   const [findText, setFindText] = useState('');
   const [replaceText, setReplaceText] = useState('');
   const [useRegex, setUseRegex] = useState(false);
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [wholeWord, setWholeWord] = useState(false);
   const [findInSelection, setFindInSelection] = useState(false);
-  const [matches, setMatches] = useState<Match[]>([]);
-  const [currentMatchIndex, setCurrentMatchIndex] = useState(-1);
-  const [regexError, setRegexError] = useState('');
+  const [, forceRender] = useState(0);
+  // Selection captured when the dialog opens (the editor keeps it while the input has focus)
+  const selectionRange = useRef<{ from: number; to: number } | null>(null);
 
-  // Clear highlights
-  const clearHighlights = () => {
-    if (!editorRef.current) return;
-    const editorElement = editorRef.current.getContentElement();
-    if (!editorElement) return;
-
-    // Remove all highlight marks
-    const highlights = editorElement.querySelectorAll('mark.find-highlight');
-    highlights.forEach(mark => {
-      const parent = mark.parentNode;
-      if (parent) {
-        parent.replaceChild(document.createTextNode(mark.textContent || ''), mark);
-        parent.normalize();
-      }
-    });
-  };
-
-  // Get text nodes from editor
-  const getTextNodes = (node: Node, selectionOnly: boolean = false): Text[] => {
-    const textNodes: Text[] = [];
-
-    let range: Range | null = null;
-    if (selectionOnly) {
-      const selection = window.getSelection();
-      if (!selection || selection.rangeCount === 0) return [];
-      range = selection.getRangeAt(0);
+  useEffect(() => {
+    if (!isOpen || !editor) return;
+    const { from, to, empty } = editor.state.selection;
+    selectionRange.current = empty ? null : { from, to };
+    if (!empty && to - from < 200 && !findText) {
+      const selected = editor.state.doc.textBetween(from, to, ' ');
+      if (!selected.includes('\n')) setFindText(selected);
     }
-
-    const walk = (n: Node) => {
-      if (n.nodeType === Node.TEXT_NODE) {
-        const textNode = n as Text;
-        if (textNode.textContent && textNode.textContent.trim()) {
-          // If selection only, check if node is in range
-          if (range) {
-            if (range.intersectsNode(n)) {
-              textNodes.push(textNode);
-            }
-          } else {
-            textNodes.push(textNode);
-          }
-        }
-      } else {
-        n.childNodes.forEach(walk);
+    const rerender = ({ transaction }: { transaction: Transaction }) => {
+      // keep the "find in selection" range on the same text through replacements
+      const range = selectionRange.current;
+      if (range && transaction.docChanged) {
+        selectionRange.current = { from: transaction.mapping.map(range.from, -1), to: transaction.mapping.map(range.to, 1) };
       }
+      forceRender(n => n + 1);
     };
+    editor.on('transaction', rerender);
+    return () => {
+      editor.off('transaction', rerender);
+      if (!editor.isDestroyed) editor.commands.clearSearch();
+    };
+  }, [isOpen, editor]);
 
-    walk(node);
-    return textNodes;
-  };
+  // Live search as options change
+  useEffect(() => {
+    if (!isOpen || !editor) return;
+    editor.commands.setSearch({
+      term: findText,
+      regex: useRegex,
+      caseSensitive,
+      wholeWord,
+      range: findInSelection ? selectionRange.current : null,
+    });
+  }, [isOpen, editor, findText, useRegex, caseSensitive, wholeWord, findInSelection]);
 
-  // Find matches
+  const search = editor ? getSearchState(editor.state) : null;
+  const matchCount = search?.matches.length || 0;
+  const currentMatchIndex = matchCount ? search!.current : -1;
+  const regexError = search?.error ? `${t(uiLanguage, 'invalidRegex')}: ${search.error}` : null;
+
+  const nextMatch = () => editor && matchCount && editor.commands.goToMatch(currentMatchIndex + 1);
+  const previousMatch = () => editor && matchCount && editor.commands.goToMatch(currentMatchIndex - 1);
   const findMatches = () => {
-    if (!editorRef.current || !findText) {
-      setMatches([]);
-      setCurrentMatchIndex(-1);
-      clearHighlights();
-      return;
-    }
-
-    const editorElement = editorRef.current.getContentElement();
-    if (!editorElement) return;
-
-    clearHighlights();
-    setRegexError('');
-    const foundMatches: Match[] = [];
-
-    try {
-      let pattern: RegExp;
-
-      if (useRegex) {
-        // User-provided regex
-        const flags = caseSensitive ? 'g' : 'gi';
-        pattern = new RegExp(findText, flags);
-      } else {
-        // Escape special regex characters
-        let escapedText = findText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-        // Whole word matching
-        if (wholeWord) {
-          escapedText = `\\b${escapedText}\\b`;
-        }
-
-        const flags = caseSensitive ? 'g' : 'gi';
-        pattern = new RegExp(escapedText, flags);
-      }
-
-      const textNodes = getTextNodes(editorElement, findInSelection);
-
-      textNodes.forEach(node => {
-        const text = node.textContent || '';
-        let match;
-
-        // Reset regex lastIndex
-        pattern.lastIndex = 0;
-
-        while ((match = pattern.exec(text)) !== null) {
-          foundMatches.push({
-            node,
-            offset: match.index,
-            length: match[0].length,
-            text: match[0]
-          });
-
-          // Prevent infinite loop with zero-length matches
-          if (match[0].length === 0) {
-            pattern.lastIndex++;
-          }
-        }
-      });
-
-      setMatches(foundMatches);
-      setCurrentMatchIndex(foundMatches.length > 0 ? 0 : -1);
-
-      // Highlight all matches
-      highlightMatches(foundMatches);
-
-      // Jump to first match
-      if (foundMatches.length > 0) {
-        jumpToMatch(0, foundMatches);
-      }
-    } catch (error) {
-      setRegexError(error instanceof Error ? error.message : 'Invalid regex pattern');
-      setMatches([]);
-      setCurrentMatchIndex(-1);
-    }
+    if (!editor) return;
+    if (matchCount) editor.commands.goToMatch(currentMatchIndex);
   };
-
-  // Highlight matches
-  const highlightMatches = (matchList: Match[]) => {
-    matchList.forEach((match, index) => {
-      const mark = document.createElement('mark');
-      mark.className = 'find-highlight';
-      mark.style.backgroundColor = darkMode ? 'rgba(251, 191, 36, 0.4)' : 'rgba(251, 191, 36, 0.6)';
-      mark.style.borderRadius = '2px';
-      mark.style.padding = '0 2px';
-
-      const range = document.createRange();
-      range.setStart(match.node, match.offset);
-      range.setEnd(match.node, match.offset + match.length);
-      range.surroundContents(mark);
-    });
-  };
-
-  // Jump to match
-  const jumpToMatch = (index: number, matchList: Match[] = matches) => {
-    if (index < 0 || index >= matchList.length) return;
-
-    const match = matchList[index];
-
-    // Find the mark element
-    let currentNode: Node | null = match.node;
-    while (currentNode && currentNode.nodeType !== Node.ELEMENT_NODE) {
-      currentNode = currentNode.parentNode;
-    }
-
-    if (currentNode && currentNode instanceof HTMLElement) {
-      // Scroll to element
-      currentNode.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-      // Update highlight to show current match
-      if (editorRef.current) {
-        const editorElement = editorRef.current.getContentElement();
-        if (editorElement) {
-          const highlights = editorElement.querySelectorAll('mark.find-highlight');
-          highlights.forEach((mark, i) => {
-            if (i === index) {
-              (mark as HTMLElement).style.backgroundColor = darkMode ? 'rgba(59, 130, 246, 0.6)' : 'rgba(59, 130, 246, 0.4)';
-              (mark as HTMLElement).style.outline = '2px solid rgb(59, 130, 246)';
-            } else {
-              (mark as HTMLElement).style.backgroundColor = darkMode ? 'rgba(251, 191, 36, 0.4)' : 'rgba(251, 191, 36, 0.6)';
-              (mark as HTMLElement).style.outline = 'none';
-            }
-          });
-        }
-      }
-    }
-  };
-
-  // Navigate matches
-  const nextMatch = () => {
-    if (matches.length === 0) return;
-    const newIndex = (currentMatchIndex + 1) % matches.length;
-    setCurrentMatchIndex(newIndex);
-    jumpToMatch(newIndex);
-  };
-
-  const previousMatch = () => {
-    if (matches.length === 0) return;
-    const newIndex = currentMatchIndex <= 0 ? matches.length - 1 : currentMatchIndex - 1;
-    setCurrentMatchIndex(newIndex);
-    jumpToMatch(newIndex);
-  };
-
-  // Replace current match
   const replaceCurrent = () => {
-    if (currentMatchIndex < 0 || currentMatchIndex >= matches.length) return;
-
-    const match = matches[currentMatchIndex];
-    const mark = findMarkElement(match);
-
-    if (mark && mark.parentNode) {
-      const textNode = document.createTextNode(replaceText);
-      mark.parentNode.replaceChild(textNode, mark);
-
-      // Rerun search to update matches
-      setTimeout(() => {
-        findMatches();
-      }, 0);
-    }
+    if (!editor || currentMatchIndex < 0) return;
+    editor.commands.replaceMatch(replaceText);
   };
-
-  // Replace all matches
   const replaceAll = () => {
-    if (matches.length === 0) return;
-
-    // Replace from end to start to preserve indices
-    const sortedMatches = [...matches].reverse();
-
-    sortedMatches.forEach(match => {
-      const mark = findMarkElement(match);
-      if (mark && mark.parentNode) {
-        const textNode = document.createTextNode(replaceText);
-        mark.parentNode.replaceChild(textNode, mark);
-      }
-    });
-
-    // Normalize editor to merge text nodes
-    if (editorRef.current) {
-      const editorElement = editorRef.current.getContentElement();
-      if (editorElement) {
-        editorElement.normalize();
-      }
-    }
-
-    // Clear matches
-    setMatches([]);
-    setCurrentMatchIndex(-1);
+    if (!editor || !matchCount) return;
+    editor.commands.replaceAllMatches(replaceText);
   };
 
-  // Find mark element for a match
-  const findMarkElement = (match: Match): HTMLElement | null => {
-    if (!editorRef.current) return null;
-    const editorElement = editorRef.current.getContentElement();
-    if (!editorElement) return null;
-
-    const highlights = editorElement.querySelectorAll('mark.find-highlight');
-    for (let i = 0; i < highlights.length; i++) {
-      const mark = highlights[i] as HTMLElement;
-      if (mark.textContent === match.text) {
-        return mark;
-      }
-    }
-    return null;
-  };
-
-  // Clear on close
-  useEffect(() => {
-    if (!isOpen) {
-      clearHighlights();
-      setMatches([]);
-      setCurrentMatchIndex(-1);
-    }
-  }, [isOpen]);
-
-  // Keyboard shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (!isOpen) return;
-
-      if (e.key === 'Enter' && e.shiftKey) {
-        e.preventDefault();
-        previousMatch();
-      } else if (e.key === 'Enter') {
-        e.preventDefault();
-        nextMatch();
-      } else if (e.key === 'Escape') {
-        onClose();
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, matches, currentMatchIndex]);
+  // Esc closes it from anywhere (also while typing in the document)
+  useEscapeKey(isOpen, onClose);
 
   if (!isOpen) return null;
 
@@ -325,15 +95,15 @@ export const AdvancedFindReplace: React.FC<AdvancedFindReplaceProps> = ({
   const buttonBg = darkMode ? 'bg-[#2a2a2a] hover:bg-[#3a3a3a]' : 'bg-gray-100 hover:bg-gray-200';
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-sm">
-      <div className={`w-[500px] rounded-lg shadow-2xl border ${bg}`}>
+    <div className="fixed top-16 right-4 sm:right-8 z-[70]">
+      <div className={`w-[500px] max-w-[calc(100vw-2rem)] rounded-lg shadow-2xl border ${bg}`} role="dialog" aria-modal="false" aria-labelledby="find-replace-title">
         {/* Header */}
         <div className={`p-4 border-b flex justify-between items-center ${darkMode ? 'border-gray-700' : 'border-gray-200'}`}>
-          <h2 className="text-lg font-bold flex items-center gap-2">
+          <h2 id="find-replace-title" className="text-lg font-bold flex items-center gap-2">
             <Search size={20} />
             {t(uiLanguage, 'findReplace')}
           </h2>
-          <button onClick={onClose} className="opacity-60 hover:opacity-100">
+          <button onClick={onClose} className="opacity-60 hover:opacity-100" aria-label={t(uiLanguage, 'close')}>
             <X size={20} />
           </button>
         </div>
@@ -341,18 +111,23 @@ export const AdvancedFindReplace: React.FC<AdvancedFindReplaceProps> = ({
         <div className="p-4 space-y-4">
           {/* Find Input */}
           <div>
-            <label className="text-xs opacity-60 block mb-1">{t(uiLanguage, 'findText')}</label>
+            <label htmlFor="find-replace-find" className="text-xs opacity-60 block mb-1">{t(uiLanguage, 'findText')}</label>
             <div className="flex gap-2">
               <input
+                id="find-replace-find"
                 type="text"
                 value={findText}
+                aria-invalid={!!regexError}
+                aria-describedby="find-replace-status"
                 onChange={(e) => setFindText(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    findMatches();
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (e.shiftKey) previousMatch();
+                    else nextMatch();
                   }
                 }}
-                className={`flex-1 px-3 py-2 rounded border ${inputBg}`}
+                className={`flex-1 min-w-0 px-3 py-2 rounded border ${inputBg}`}
                 placeholder={t(uiLanguage, 'enterSearchTerm')}
                 autoFocus
               />
@@ -368,13 +143,14 @@ export const AdvancedFindReplace: React.FC<AdvancedFindReplaceProps> = ({
 
           {/* Replace Input */}
           <div>
-            <label className="text-xs opacity-60 block mb-1">{t(uiLanguage, 'replaceWith')}</label>
+            <label htmlFor="find-replace-replace" className="text-xs opacity-60 block mb-1">{t(uiLanguage, 'replaceWith')}</label>
             <div className="flex gap-2">
               <input
+                id="find-replace-replace"
                 type="text"
                 value={replaceText}
                 onChange={(e) => setReplaceText(e.target.value)}
-                className={`flex-1 px-3 py-2 rounded border ${inputBg}`}
+                className={`flex-1 min-w-0 px-3 py-2 rounded border ${inputBg}`}
                 placeholder={t(uiLanguage, 'enterReplacementText')}
               />
             </div>
@@ -413,7 +189,14 @@ export const AdvancedFindReplace: React.FC<AdvancedFindReplaceProps> = ({
               <input
                 type="checkbox"
                 checked={findInSelection}
-                onChange={(e) => setFindInSelection(e.target.checked)}
+                onChange={(e) => {
+                  // Use the editor's current selection if one was made after opening.
+                  if (e.target.checked && editor && !editor.state.selection.empty) {
+                    const { from, to } = editor.state.selection;
+                    selectionRange.current = { from, to };
+                  }
+                  setFindInSelection(e.target.checked);
+                }}
                 className="w-4 h-4"
               />
               <span className="text-sm">{t(uiLanguage, 'findInSelection')}</span>
@@ -429,16 +212,20 @@ export const AdvancedFindReplace: React.FC<AdvancedFindReplaceProps> = ({
           )}
 
           {/* Match Counter */}
-          {matches.length > 0 && (
+          {findText && !regexError && matchCount === 0 && (
+            <div className="text-sm opacity-70">{t(uiLanguage, 'noMatchesFound')}</div>
+          )}
+          {matchCount > 0 && (
             <div className="flex items-center justify-between">
               <span className="text-sm opacity-70">
-                {currentMatchIndex + 1} {t(uiLanguage, 'of')} {matches.length} {t(uiLanguage, 'matches')}
+                {currentMatchIndex + 1} {t(uiLanguage, 'of')} {matchCount} {t(uiLanguage, 'matches')}
               </span>
               <div className="flex gap-1">
                 <button
                   onClick={previousMatch}
                   className={`p-2 rounded ${buttonBg}`}
                   title={t(uiLanguage, 'previousMatch')}
+                  aria-label={t(uiLanguage, 'previousMatch')}
                 >
                   <ChevronUp size={16} />
                 </button>
@@ -446,12 +233,18 @@ export const AdvancedFindReplace: React.FC<AdvancedFindReplaceProps> = ({
                   onClick={nextMatch}
                   className={`p-2 rounded ${buttonBg}`}
                   title={t(uiLanguage, 'nextMatch')}
+                  aria-label={t(uiLanguage, 'nextMatch')}
                 >
                   <ChevronDown size={16} />
                 </button>
               </div>
             </div>
           )}
+
+          {/* Screen-reader status */}
+          <div id="find-replace-status" className="sr-only" aria-live="polite">
+            {regexError || (findText ? (matchCount ? `${currentMatchIndex + 1} ${t(uiLanguage, 'of')} ${matchCount} ${t(uiLanguage, 'matches')}` : t(uiLanguage, 'noMatchesFound')) : '')}
+          </div>
 
           {/* Action Buttons */}
           <div className="flex gap-2 pt-2">
@@ -465,7 +258,7 @@ export const AdvancedFindReplace: React.FC<AdvancedFindReplaceProps> = ({
             </button>
             <button
               onClick={replaceAll}
-              disabled={matches.length === 0}
+              disabled={matchCount === 0}
               className={`flex-1 px-4 py-2 rounded flex items-center justify-center gap-2 bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-30 disabled:cursor-not-allowed`}
             >
               <Replace size={16} />

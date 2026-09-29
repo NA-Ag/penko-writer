@@ -20,6 +20,11 @@ export const WordGoalTracker: React.FC<WordGoalTrackerProps> = ({
   const [isEditingGoal, setIsEditingGoal] = React.useState(false);
   const [goalInput, setGoalInput] = React.useState(goalWords?.toString() || '');
 
+  // Keep the input in sync when the goal is set elsewhere (e.g. the Zen setup dialog)
+  React.useEffect(() => {
+    if (!isEditingGoal) setGoalInput(goalWords?.toString() || '');
+  }, [goalWords, isEditingGoal]);
+
   const handleSetGoal = () => {
     const goal = parseInt(goalInput);
     if (!isNaN(goal) && goal > 0) {
@@ -51,9 +56,14 @@ export const WordGoalTracker: React.FC<WordGoalTrackerProps> = ({
           <Target size={20} className="text-blue-600" />
           <input
             type="number"
+            min="1"
+            inputMode="numeric"
             value={goalInput}
             onChange={(e) => setGoalInput(e.target.value)}
-            onKeyPress={(e) => e.key === 'Enter' && handleSetGoal()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.nativeEvent.isComposing) handleSetGoal();
+              else if (e.key === 'Escape') setIsEditingGoal(false);
+            }}
             placeholder={t(uiLanguage, 'enterWordGoal')}
             className={`flex-1 px-3 py-1.5 rounded-lg border ${borderColor} ${inputBg} outline-none focus:ring-2 focus:ring-blue-500`}
             autoFocus

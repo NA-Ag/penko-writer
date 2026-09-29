@@ -1,13 +1,14 @@
-
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState } from 'react';
 import { ChevronDown, ChevronRight, GripVertical, List } from 'lucide-react';
 import { t, LanguageCode } from '../utils/translations';
+import { useApp } from '../AppContext';
+import { collectHeadings, moveSection, OutlineHeading } from '../utils/outline';
 
 interface HeadingNode {
   id: string;
   level: number; // 1-6 for H1-H6
   text: string;
-  element: HTMLElement;
+  heading: OutlineHeading;
   children: HeadingNode[];
   isCollapsed?: boolean;
 }
@@ -17,150 +18,118 @@ interface DocumentOutlineProps {
   onClose: () => void;
   darkMode: boolean;
   uiLanguage: LanguageCode;
-  editorRef: React.RefObject<HTMLDivElement>;
-  onContentReorder?: (headingId: string, targetId: string, position: 'before' | 'after') => void;
 }
+
+const buildTree = (headings: OutlineHeading[], collapsed: Set<string>, untitled: string): HeadingNode[] => {
+  const nodes: HeadingNode[] = [];
+  const stack: HeadingNode[] = [];
+  headings.forEach(h => {
+    const id = `heading-${h.index}`;
+    const node: HeadingNode = { id, level: h.level, text: h.text || untitled, heading: h, children: [], isCollapsed: collapsed.has(id) };
+    while (stack.length > 0 && stack[stack.length - 1].level >= h.level) stack.pop();
+    if (stack.length === 0) nodes.push(node);
+    else stack[stack.length - 1].children.push(node);
+    stack.push(node);
+  });
+  return nodes;
+};
 
 export const DocumentOutline: React.FC<DocumentOutlineProps> = ({
   isOpen,
   onClose,
   darkMode,
   uiLanguage,
-  editorRef,
-  onContentReorder
 }) => {
-  const [outline, setOutline] = useState<HeadingNode[]>([]);
+  const { editor } = useApp();
+  const [headings, setHeadings] = useState<OutlineHeading[]>([]);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [draggedItem, setDraggedItem] = useState<string | null>(null);
-  const [dragOverItem, setDragOverItem] = useState<string | null>(null);
+  const [dragOverItem, setDragOverItem] = useState<{ id: string; placement: 'before' | 'after' } | null>(null);
 
-  // Extract headings from editor content
-  const extractHeadings = (): HeadingNode[] => {
-    if (!editorRef.current) return [];
-
-    const editorElement = editorRef.current.getContentElement();
-    if (!editorElement) return [];
-
-    const headings = editorElement.querySelectorAll('h1, h2, h3, h4, h5, h6');
-    const nodes: HeadingNode[] = [];
-    const stack: HeadingNode[] = [];
-
-    headings.forEach((heading, index) => {
-      const level = parseInt(heading.tagName.substring(1));
-      const text = heading.textContent || 'Untitled';
-      const id = heading.id || `heading-${index}`;
-
-      // Ensure heading has an ID for navigation
-      if (!heading.id) {
-        heading.id = id;
-      }
-
-      const node: HeadingNode = {
-        id,
-        level,
-        text,
-        element: heading as HTMLElement,
-        children: [],
-        isCollapsed: false
-      };
-
-      // Build hierarchy
-      while (stack.length > 0 && stack[stack.length - 1].level >= level) {
-        stack.pop();
-      }
-
-      if (stack.length === 0) {
-        nodes.push(node);
-      } else {
-        stack[stack.length - 1].children.push(node);
-      }
-
-      stack.push(node);
-    });
-
-    return nodes;
-  };
-
-  // Refresh outline when editor content changes
+  // Live list of headings from the document
   useEffect(() => {
-    if (!isOpen || !editorRef.current) return;
-
-    const editorElement = editorRef.current.getContentElement();
-    if (!editorElement) return;
-
-    const updateOutline = () => {
-      setOutline(extractHeadings());
+    if (!isOpen || !editor || editor.isDestroyed) {
+      setHeadings([]);
+      return;
+    }
+    let timer = 0;
+    const update = () => {
+      if (!editor.isDestroyed) setHeadings(collectHeadings(editor.state.doc));
     };
+    const schedule = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(update, 150);
+    };
+    update();
+    editor.on('update', schedule);
+    return () => {
+      window.clearTimeout(timer);
+      editor.off('update', schedule);
+    };
+  }, [isOpen, editor]);
 
-    // Initial extraction
-    updateOutline();
+  const outline = buildTree(headings, collapsed, t(uiLanguage, 'rvUntitledHeading'));
 
-    // Set up MutationObserver to watch for content changes
-    const observer = new MutationObserver(updateOutline);
-    observer.observe(editorElement, {
-      childList: true,
-      subtree: true,
-      characterData: true
-    });
-
-    return () => observer.disconnect();
-  }, [isOpen, editorRef]);
-
-  // Scroll to heading when clicked
+  // Put the cursor in the heading and scroll it into view (in #editor-scroll-container)
   const handleHeadingClick = (node: HeadingNode) => {
-    node.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-    // Highlight briefly
-    node.element.style.backgroundColor = darkMode ? 'rgba(59, 130, 246, 0.2)' : 'rgba(59, 130, 246, 0.1)';
-    setTimeout(() => {
-      node.element.style.backgroundColor = '';
-    }, 1000);
-  };
-
-  // Toggle collapse state
-  const toggleCollapse = (nodeId: string, nodes: HeadingNode[]): HeadingNode[] => {
-    return nodes.map(node => {
-      if (node.id === nodeId) {
-        return { ...node, isCollapsed: !node.isCollapsed };
-      }
-      if (node.children.length > 0) {
-        return { ...node, children: toggleCollapse(nodeId, node.children) };
-      }
-      return node;
-    });
+    if (!editor || editor.isDestroyed) return;
+    const pos = node.heading.pos;
+    const current = editor.state.doc.nodeAt(pos);
+    if (!current || current.type.name !== 'heading') return;
+    editor.chain().focus().setTextSelection(pos + 1 + current.content.size).run();
+    const dom = editor.view.nodeDOM(pos) as HTMLElement | null;
+    dom?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
   };
 
   const handleToggleCollapse = (nodeId: string) => {
-    setOutline(prev => toggleCollapse(nodeId, prev));
+    setCollapsed(prev => {
+      const next = new Set(prev);
+      if (next.has(nodeId)) next.delete(nodeId);
+      else next.add(nodeId);
+      return next;
+    });
   };
 
-  // Drag and drop handlers
-  const handleDragStart = (e: React.DragEvent, nodeId: string) => {
-    setDraggedItem(nodeId);
-    e.dataTransfer.effectAllowed = 'move';
+  // Drag and drop: move a whole section (heading + its content) in one undoable transaction
+  const findNode = (id: string, nodes: HeadingNode[] = outline): HeadingNode | null => {
+    for (const n of nodes) {
+      if (n.id === id) return n;
+      const child = findNode(id, n.children);
+      if (child) return child;
+    }
+    return null;
   };
 
-  const handleDragOver = (e: React.DragEvent, nodeId: string) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    setDragOverItem(nodeId);
-  };
-
-  const handleDrop = (e: React.DragEvent, targetId: string) => {
-    e.preventDefault();
-
-    if (!draggedItem || draggedItem === targetId) {
-      setDraggedItem(null);
-      setDragOverItem(null);
+  const handleDragStart = (e: React.DragEvent, node: HeadingNode) => {
+    if (!node.heading.topLevel) {
+      e.preventDefault();
       return;
     }
+    setDraggedItem(node.id);
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', node.text);
+  };
 
-    // Call reorder callback if provided
-    if (onContentReorder) {
-      onContentReorder(draggedItem, targetId, 'before');
-    }
+  const handleDragOver = (e: React.DragEvent, node: HeadingNode) => {
+    if (!draggedItem || !node.heading.topLevel) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const placement = e.clientY > rect.top + rect.height / 2 ? 'after' : 'before';
+    if (dragOverItem?.id !== node.id || dragOverItem.placement !== placement) setDragOverItem({ id: node.id, placement });
+  };
 
+  const handleDrop = (e: React.DragEvent, target: HeadingNode) => {
+    e.preventDefault();
+    const source = draggedItem ? findNode(draggedItem) : null;
+    const placement = dragOverItem?.placement || 'before';
     setDraggedItem(null);
     setDragOverItem(null);
+    if (!source || !editor || editor.isDestroyed || source.id === target.id) return;
+    const tr = editor.state.tr;
+    if (moveSection(tr, source.heading.pos, target.heading.pos, placement)) {
+      editor.view.dispatch(tr.scrollIntoView());
+    }
   };
 
   const handleDragEnd = () => {
@@ -172,7 +141,8 @@ export const DocumentOutline: React.FC<DocumentOutlineProps> = ({
   const renderNode = (node: HeadingNode, depth: number = 0): React.ReactNode => {
     const hasChildren = node.children.length > 0;
     const isDragging = draggedItem === node.id;
-    const isDragOver = dragOverItem === node.id;
+    const isDragOver = dragOverItem?.id === node.id;
+    const dropLine = isDragOver ? (dragOverItem!.placement === 'before' ? 'border-t-2 border-blue-500' : 'border-b-2 border-blue-500') : '';
 
     return (
       <div key={node.id} className="outline-node">
@@ -183,16 +153,17 @@ export const DocumentOutline: React.FC<DocumentOutlineProps> = ({
             ${darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100'}
             ${isDragging ? 'opacity-50' : ''}
             ${isDragOver ? (darkMode ? 'bg-blue-900/30' : 'bg-blue-100') : ''}
+            ${dropLine}
           `}
           style={{ paddingLeft: `${depth * 16 + 8}px` }}
-          draggable
-          onDragStart={(e) => handleDragStart(e, node.id)}
-          onDragOver={(e) => handleDragOver(e, node.id)}
-          onDrop={(e) => handleDrop(e, node.id)}
+          draggable={node.heading.topLevel}
+          onDragStart={(e) => handleDragStart(e, node)}
+          onDragOver={(e) => handleDragOver(e, node)}
+          onDrop={(e) => handleDrop(e, node)}
           onDragEnd={handleDragEnd}
         >
           {/* Drag handle */}
-          <GripVertical size={14} className="opacity-40 flex-shrink-0" />
+          <GripVertical size={14} className="opacity-40 flex-shrink-0" aria-hidden="true" />
 
           {/* Collapse toggle */}
           {hasChildren ? (
@@ -202,6 +173,8 @@ export const DocumentOutline: React.FC<DocumentOutlineProps> = ({
                 handleToggleCollapse(node.id);
               }}
               className="flex-shrink-0 opacity-60 hover:opacity-100"
+              aria-expanded={!node.isCollapsed}
+              aria-label={t(uiLanguage, node.isCollapsed ? 'rvExpandSection' : 'rvCollapseSection')}
             >
               {node.isCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
             </button>
@@ -212,6 +185,15 @@ export const DocumentOutline: React.FC<DocumentOutlineProps> = ({
           {/* Heading text */}
           <div
             onClick={() => handleHeadingClick(node)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                handleHeadingClick(node);
+              }
+            }}
+            role="button"
+            tabIndex={0}
+            aria-level={node.level}
             className="flex-1 truncate"
             title={node.text}
             style={{
@@ -238,10 +220,21 @@ export const DocumentOutline: React.FC<DocumentOutlineProps> = ({
   const bg = darkMode ? 'bg-[#1e1e1e] border-gray-700 text-gray-200' : 'bg-white border-gray-200 text-gray-900';
 
   return (
-    <div className={`fixed right-0 top-0 h-full w-64 border-l shadow-lg z-50 flex flex-col ${bg}`}>
+    <div
+      role="complementary"
+      aria-labelledby="outline-panel-title"
+      data-outline-panel=""
+      // Esc closes the panel while focus is inside it
+      onKeyDown={e => {
+        if (e.key === 'Escape' && !e.defaultPrevented) {
+          e.preventDefault();
+          onClose();
+        }
+      }}
+      className={`fixed right-0 top-0 h-full w-64 border-l shadow-lg z-50 flex flex-col ${bg}`}>
       {/* Header */}
       <div className={`p-3 border-b flex items-center justify-between ${darkMode ? 'border-gray-700' : 'border-gray-200'}`}>
-        <h3 className="font-semibold text-sm flex items-center gap-2">
+        <h3 id="outline-panel-title" className="font-semibold text-sm flex items-center gap-2">
           <List size={16} className="text-blue-500" />
           {t(uiLanguage, 'documentOutline')}
         </h3>

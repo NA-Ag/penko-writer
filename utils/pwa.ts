@@ -1,100 +1,153 @@
-// PWA utilities for service worker registration and install prompt
+// PWA utilities: service worker registration (vite-plugin-pwa / Workbox),
+// update + install prompt state shared with components/InstallPrompt.tsx.
+
+import { registerSW } from 'virtual:pwa-register';
+import { isLegacyCacheName } from './pwaHelpers';
+
+export * from './pwaHelpers';
 
 export interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
   userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }>;
 }
 
+export interface PwaState {
+  /** A new version has been installed and is waiting to activate. */
+  needRefresh: boolean;
+  /** The app has been cached for offline use for the first time. */
+  offlineReady: boolean;
+  /** The browser offered an install prompt (beforeinstallprompt). */
+  canInstall: boolean;
+}
+
+let state: PwaState = { needRefresh: false, offlineReady: false, canInstall: false };
+const listeners = new Set<() => void>();
 let deferredPrompt: BeforeInstallPromptEvent | null = null;
+let updateSW: ((reloadPage?: boolean) => Promise<void>) | null = null;
+let registered = false;
+let installListenerAttached = false;
+
+function setState(patch: Partial<PwaState>) {
+  state = { ...state, ...patch };
+  listeners.forEach((l) => l());
+}
+
+export function subscribePwa(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+export function getPwaState(): PwaState {
+  return state;
+}
 
 /**
- * Register the service worker for offline functionality
+ * One-time cleanup for users who had the old hand-written service worker:
+ * drop its caches and unregister any registration that isn't the current SW.
  */
-export async function registerServiceWorker(): Promise<ServiceWorkerRegistration | null> {
-  if ('serviceWorker' in navigator) {
-    try {
-      const registration = await navigator.serviceWorker.register('/sw.js', {
-        scope: '/',
-      });
-
-      console.log('[PWA] Service Worker registered successfully:', registration.scope);
-
-      // Check for updates periodically
-      setInterval(() => {
-        registration.update();
-      }, 60000); // Check every minute
-
-      // Listen for service worker updates
-      registration.addEventListener('updatefound', () => {
-        const newWorker = registration.installing;
-        if (newWorker) {
-          newWorker.addEventListener('statechange', () => {
-            if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-              // New service worker available
-              console.log('[PWA] New version available! Refresh to update.');
-
-              // Notify user (you can implement a custom notification UI)
-              if (confirm('A new version of Penko Writer is available. Refresh to update?')) {
-                newWorker.postMessage({ type: 'SKIP_WAITING' });
-                window.location.reload();
-              }
-            }
-          });
-        }
-      });
-
-      return registration;
-    } catch (error) {
-      console.error('[PWA] Service Worker registration failed:', error);
-      return null;
+async function cleanupLegacyServiceWorker(currentScriptUrl?: string): Promise<void> {
+  try {
+    if ('caches' in window) {
+      const names = await caches.keys();
+      await Promise.all(names.filter(isLegacyCacheName).map((n) => caches.delete(n)));
     }
-  } else {
-    console.warn('[PWA] Service Workers are not supported in this browser');
-    return null;
+    if (currentScriptUrl && 'serviceWorker' in navigator) {
+      const current = new URL(currentScriptUrl, location.href).href;
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(
+        regs
+          .filter((r) => {
+            const url = (r.active || r.waiting || r.installing)?.scriptURL;
+            return url && url !== current;
+          })
+          .map((r) => r.unregister()),
+      );
+    }
+  } catch (e) {
+    console.warn('[PWA] Legacy cleanup failed:', e);
   }
 }
 
 /**
- * Set up the beforeinstallprompt event listener
+ * Register the Workbox service worker (production only). New versions are not
+ * activated automatically: `needRefresh` becomes true and the UI offers an update.
  */
-export function setupInstallPrompt(onPromptReady?: () => void): void {
-  window.addEventListener('beforeinstallprompt', (e: Event) => {
-    // Prevent the default mini-infobar
-    e.preventDefault();
-
-    // Store the event for later use
-    deferredPrompt = e as BeforeInstallPromptEvent;
-
-    console.log('[PWA] Install prompt ready');
-
-    // Notify the app that install prompt is available
-    if (onPromptReady) {
-      onPromptReady();
-    }
+export function registerServiceWorker(): void {
+  if (registered || !('serviceWorker' in navigator)) return;
+  registered = true;
+  updateSW = registerSW({
+    immediate: true,
+    onNeedRefresh() {
+      setState({ needRefresh: true });
+    },
+    onOfflineReady() {
+      setState({ offlineReady: true });
+    },
+    onNeedReload: reloadOnce,
+    onRegisteredSW(swUrl, registration) {
+      void cleanupLegacyServiceWorker(swUrl);
+      if (!registration) return;
+      const check = () => {
+        if (navigator.onLine && !registration.installing) registration.update().catch(() => {});
+      };
+      // Check for a new version hourly and whenever the tab becomes visible again.
+      setInterval(check, 60 * 60 * 1000);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') check();
+      });
+    },
+    onRegisterError(error) {
+      console.error('[PWA] Service worker registration failed:', error);
+    },
   });
 }
 
-/**
- * Show the install prompt to the user
- */
-export async function showInstallPrompt(): Promise<'accepted' | 'dismissed' | 'unavailable'> {
-  if (!deferredPrompt) {
-    console.warn('[PWA] Install prompt not available');
-    return 'unavailable';
-  }
+let reloading = false;
+function reloadOnce() {
+  if (reloading) return;
+  reloading = true;
+  window.location.reload();
+}
 
-  try {
-    // Show the install prompt
-    await deferredPrompt.prompt();
+/** Activate the waiting service worker and reload once it has taken control. */
+export async function applyUpdate(): Promise<void> {
+  // workbox-window only reloads for updates it started itself; updates found by
+  // the periodic registration.update() count as "external", so reload on the
+  // controller change ourselves (guarded against a double reload).
+  navigator.serviceWorker?.addEventListener('controllerchange', reloadOnce, { once: true });
+  if (updateSW) await updateSW(true);
+}
 
-    // Wait for the user's response
-    const { outcome } = await deferredPrompt.userChoice;
+export function dismissUpdate(): void {
+  setState({ needRefresh: false });
+}
 
-    console.log('[PWA] User choice:', outcome);
+export function dismissOfflineReady(): void {
+  setState({ offlineReady: false });
+}
 
-    // Clear the deferred prompt
+/** Listen for beforeinstallprompt. Safe to call more than once. */
+export function setupInstallPrompt(): void {
+  if (installListenerAttached) return;
+  installListenerAttached = true;
+  window.addEventListener('beforeinstallprompt', (e: Event) => {
+    e.preventDefault(); // suppress the default mini-infobar
+    deferredPrompt = e as BeforeInstallPromptEvent;
+    setState({ canInstall: true });
+  });
+  window.addEventListener('appinstalled', () => {
     deferredPrompt = null;
+    setState({ canInstall: false });
+  });
+}
 
+export async function showInstallPrompt(): Promise<'accepted' | 'dismissed' | 'unavailable'> {
+  if (!deferredPrompt) return 'unavailable';
+  try {
+    await deferredPrompt.prompt();
+    const { outcome } = await deferredPrompt.userChoice;
+    deferredPrompt = null;
+    setState({ canInstall: false });
     return outcome;
   } catch (error) {
     console.error('[PWA] Error showing install prompt:', error);
@@ -102,53 +155,15 @@ export async function showInstallPrompt(): Promise<'accepted' | 'dismissed' | 'u
   }
 }
 
-/**
- * Check if the app is running in standalone mode (installed as PWA)
- */
-export function isStandalone(): boolean {
-  return (
-    window.matchMedia('(display-mode: standalone)').matches ||
-    (window.navigator as any).standalone === true || // iOS Safari
-    document.referrer.includes('android-app://') // Android
-  );
-}
-
-/**
- * Check if install prompt is available
- */
 export function isInstallPromptAvailable(): boolean {
   return deferredPrompt !== null;
 }
 
-/**
- * Check if the browser supports PWA features
- */
-export function isPWASupported(): boolean {
+/** True when running as an installed app. */
+export function isStandalone(): boolean {
   return (
-    'serviceWorker' in navigator &&
-    'caches' in window &&
-    'PushManager' in window
+    window.matchMedia('(display-mode: standalone)').matches ||
+    (window.navigator as any).standalone === true || // iOS Safari
+    document.referrer.includes('android-app://')
   );
-}
-
-/**
- * Clear all service worker caches (useful for debugging)
- */
-export async function clearAllCaches(): Promise<void> {
-  if ('caches' in window) {
-    const cacheNames = await caches.keys();
-    await Promise.all(cacheNames.map(name => caches.delete(name)));
-    console.log('[PWA] All caches cleared');
-  }
-}
-
-/**
- * Unregister all service workers (useful for debugging)
- */
-export async function unregisterServiceWorker(): Promise<void> {
-  if ('serviceWorker' in navigator) {
-    const registrations = await navigator.serviceWorker.getRegistrations();
-    await Promise.all(registrations.map(registration => registration.unregister()));
-    console.log('[PWA] Service worker unregistered');
-  }
 }

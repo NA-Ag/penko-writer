@@ -1,5 +1,3 @@
-import React from 'react';
-
 export const FONTS = [
   'Inter', 'Roboto', 'Playfair Display', 'Merriweather', 'Source Code Pro', 'Arial', 'Times New Roman', 'Courier New'
 ];

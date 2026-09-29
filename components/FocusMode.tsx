@@ -1,12 +1,18 @@
 import React from 'react';
+import { useEditor, EditorContent } from '@tiptap/react';
+import type { Editor as TiptapEditor } from '@tiptap/core';
 import { X, Target, Clock, Volume2, VolumeX } from 'lucide-react';
 import { PomodoroTimer } from './PomodoroTimer';
 import { WordGoalTracker } from './WordGoalTracker';
 import { LanguageCode, t } from '../utils/translations';
+import { useApp } from '../AppContext';
+import { createExtensions } from '../editor/extensions';
+import { prepareHtmlForEditor, parseOptionsFor } from '../editor/sanitize';
+import { putBlob, getBlob, deleteBlob } from '../utils/storage';
+import { useSuppressDialogShortcuts } from '../utils/hooks';
+import '../editor/editor.css';
 
 interface FocusModeProps {
-  content: string;
-  onChange: (content: string) => void;
   onExit: () => void;
   darkMode: boolean;
   uiLanguage: LanguageCode;
@@ -16,9 +22,40 @@ interface FocusModeProps {
   onSetWordGoal: (goal: number | undefined) => void;
 }
 
+interface Track {
+  id: string;
+  name: string;
+  url: string;
+}
+
+const PLAYLIST_KEY = 'penko_ambiance_playlist';
+const ACTIVE_TRACK_KEY = 'penko_active_track_id';
+const blobKey = (id: string) => `ambiance:${id}`;
+const COMMIT_DEBOUNCE_MS = 400;
+
+const readLS = (key: string) => {
+  try { return localStorage.getItem(key); } catch { return null; }
+};
+const writeLS = (key: string, value: string | null) => {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch { /* storage unavailable */ }
+};
+
+/** Editors created by focus mode (so a new instance never mistakes one for the main editor). */
+const focusEditors = new WeakSet<TiptapEditor>();
+
+const statsOf = (ed: TiptapEditor) => {
+  const counter = (ed.storage as any).characterCount;
+  return {
+    words: counter?.words() ?? 0,
+    characters: counter?.characters() ?? 0,
+    text: ed.getText({ blockSeparator: '\n' }),
+  };
+};
+
 export const FocusMode: React.FC<FocusModeProps> = ({
-  content,
-  onChange,
   onExit,
   darkMode,
   uiLanguage,
@@ -27,186 +64,305 @@ export const FocusMode: React.FC<FocusModeProps> = ({
   wordGoal,
   onSetWordGoal,
 }) => {
+  const {
+    currentDoc,
+    editor: mainEditor,
+    setActiveEditor,
+    flushPendingEdits,
+    updateCurrentDoc,
+    handleContentChange,
+    setStats,
+    collabSession,
+    contentRevision,
+    toast,
+  } = useApp();
+
   const [showPomodoro, setShowPomodoro] = React.useState(false);
   const [showWordGoal, setShowWordGoal] = React.useState(false);
   const [showAmbiance, setShowAmbiance] = React.useState(false);
   const [showSetup, setShowSetup] = React.useState(true);
-  const [tempGoal, setTempGoal] = React.useState<string>('500');
+  const [tempGoal, setTempGoal] = React.useState<string>(() => String(wordGoal ?? 500));
   const [enableTimer, setEnableTimer] = React.useState(false);
-  const [playlist, setPlaylist] = React.useState<Array<{ id: string; name: string; url: string }>>([]);
+  const [playlist, setPlaylist] = React.useState<Track[]>([]);
   const [activeTrackId, setActiveTrackId] = React.useState<string | null>(null);
   const [ambianceVolume, setAmbianceVolume] = React.useState(0.3);
   const [isOnStrictBreak, setIsOnStrictBreak] = React.useState(false);
-  const editorRef = React.useRef<HTMLDivElement>(null);
+  const [wordCount, setWordCount] = React.useState(0);
+  const scrollRef = React.useRef<HTMLDivElement>(null);
   const audioRef = React.useRef<HTMLAudioElement | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
-  const isUpdatingRef = React.useRef(false);
+  const playlistLoaded = React.useRef(false);
 
-  // Load playlist from localStorage on mount
+  const docId = currentDoc?.id;
+  const collab = collabSession && currentDoc && collabSession.docId === currentDoc.id ? collabSession : null;
+
+  // The main editor (hidden underneath) is restored as the active editor on
+  // exit. When focus mode is re-created for another document the active
+  // editor is still the previous focus editor, which must not be used.
+  const mainEditorRef = React.useRef(mainEditor && !focusEditors.has(mainEditor) ? mainEditor : null);
+  // Computed once: sanitizing a long document on every render would be expensive
+  const [initialHtml] = React.useState(() => {
+    // Take the freshest content: the live main editor if it shows this doc.
+    const main = mainEditorRef.current;
+    if (main && !main.isDestroyed && !currentDoc?.isMarkdownMode) return prepareHtmlForEditor(main.getHTML());
+    return prepareHtmlForEditor(currentDoc?.content || '');
+  });
+
+  // --- the focus editor ---
+  const dirty = React.useRef(false);
+  const commitTimer = React.useRef(0);
+  const typewriterRef = React.useRef(typewriterMode);
+  typewriterRef.current = typewriterMode;
+  const centerCaretRef = React.useRef<() => void>(() => {});
+
+  const editor = useEditor(
+    {
+      extensions: createExtensions({ paginate: false, collaboration: collab }),
+      content: collab ? undefined : initialHtml,
+      parseOptions: parseOptionsFor(initialHtml),
+      shouldRerenderOnTransaction: false,
+      immediatelyRender: true,
+      editorProps: {
+        attributes: {
+          class: 'penko-prosemirror outline-none',
+          role: 'textbox',
+          'aria-label': t(uiLanguage, 'focusMode'),
+          'aria-multiline': 'true',
+        },
+        transformPastedHTML: html => prepareHtmlForEditor(html),
+      },
+      onCreate: ({ editor: ed }) => {
+        focusEditors.add(ed);
+        ed.commands.setReferenceData({ citations: currentDoc?.citations || [], tocTitle: t(uiLanguage, 'tableOfContents'), tocEmpty: t(uiLanguage, 'noHeadingsFoundInDoc') });
+      },
+      onUpdate: () => {
+        dirty.current = true;
+        window.clearTimeout(commitTimer.current);
+        commitTimer.current = window.setTimeout(() => commitRef.current(), COMMIT_DEBOUNCE_MS);
+      },
+      onSelectionUpdate: () => {
+        if (typewriterRef.current) centerCaretRef.current();
+      },
+      onTransaction: ({ transaction }) => {
+        if (transaction.docChanged && typewriterRef.current) centerCaretRef.current();
+      },
+    },
+    [docId, collab?.document],
+  );
+
+  // Commit to the document store without making the (hidden) main editor
+  // reload; it reloads once when focus mode closes.
+  const commitRef = React.useRef<() => void>(() => {});
+  commitRef.current = () => {
+    window.clearTimeout(commitTimer.current);
+    if (!editor || editor.isDestroyed || !dirty.current) return;
+    dirty.current = false;
+    const st = statsOf(editor);
+    setWordCount(st.words);
+    setStats(st);
+    if (collab) return; // the shared Y.Doc already carries the change
+    const html = editor.getHTML();
+    updateCurrentDoc(d => (d.id === docId ? { content: html } : {}));
+  };
+
   React.useEffect(() => {
-    const savedPlaylist = localStorage.getItem('penko_ambiance_playlist');
-    const savedActiveTrack = localStorage.getItem('penko_active_track_id');
-    if (savedPlaylist) {
-      try {
-        const parsed = JSON.parse(savedPlaylist);
-        setPlaylist(parsed);
-      } catch (e) {
-        console.error('Failed to parse playlist:', e);
+    if (!editor || editor.isDestroyed) return;
+    flushPendingEdits();
+    setActiveEditor(editor);
+    if (!editor.isDestroyed) {
+      const initial = statsOf(editor);
+      setWordCount(initial.words);
+      setStats(initial);
+    }
+    const main = mainEditorRef.current;
+    return () => {
+      const wasDirty = dirty.current;
+      commitRef.current();
+      if (!collab && !editor.isDestroyed && (wasDirty || editor.getHTML() !== initialHtml)) {
+        // One external change → the main editor reloads exactly once. The
+        // document id is explicit: focus mode may be closing because another
+        // document was opened.
+        handleContentChange(editor.getHTML(), docId);
       }
-    }
-    if (savedActiveTrack) {
-      setActiveTrackId(savedActiveTrack);
-    }
-  }, []);
+      setActiveEditor(main && !main.isDestroyed ? main : null);
+      if (main && !main.isDestroyed) setStats(statsOf(main));
+    };
+  }, [editor]);
 
-  // Initialize editor content on mount
+  // Content replaced from outside while focus mode is open (e.g. restore)
+  const lastRevision = React.useRef(contentRevision);
   React.useEffect(() => {
-    if (editorRef.current && !editorRef.current.innerHTML) {
-      isUpdatingRef.current = true;
-      editorRef.current.innerHTML = content;
-      isUpdatingRef.current = false;
-    }
-  }, []);
+    if (!editor || contentRevision === lastRevision.current) return;
+    lastRevision.current = contentRevision;
+    if (collab || !currentDoc) return;
+    dirty.current = false;
+    const html = prepareHtmlForEditor(currentDoc.content);
+    editor.commands.setContent(html, { emitUpdate: false, parseOptions: parseOptionsFor(html) });
+    const st = statsOf(editor);
+    setWordCount(st.words);
+    setStats(st);
+  }, [contentRevision, editor]);
 
-  // Word count calculation
-  const wordCount = React.useMemo(() => {
-    const div = document.createElement('div');
-    div.innerHTML = content;
-    const text = div.textContent || '';
-    return text.trim().split(/\s+/).filter(w => w.length > 0).length;
-  }, [content]);
-
-  // Typewriter mode effect - scroll to keep cursor centered
+  // Screenplay behaviour follows the document
   React.useEffect(() => {
-    if (typewriterMode && editorRef.current) {
-      const handleInput = () => {
-        const selection = window.getSelection();
-        if (selection && selection.rangeCount > 0) {
-          const range = selection.getRangeAt(0);
-          const rect = range.getBoundingClientRect();
-          const editorRect = editorRef.current?.getBoundingClientRect();
+    const sp = editor && !editor.isDestroyed ? (editor.storage as any).screenplay : null;
+    if (sp) sp.enabled = !!currentDoc?.isScreenplay;
+  }, [editor, currentDoc?.isScreenplay]);
 
-          if (editorRect) {
-            const desiredTop = editorRect.top + editorRect.height / 2;
-            const offset = rect.top - desiredTop;
+  // Strict pomodoro break locks writing
+  React.useEffect(() => {
+    // no update event: locking is not an edit
+    if (editor && !editor.isDestroyed) editor.setEditable(!isOnStrictBreak, false);
+  }, [editor, isOnStrictBreak]);
 
-            if (Math.abs(offset) > 50) {
-              editorRef.current?.scrollBy({ top: offset, behavior: 'smooth' });
-            }
-          }
-        }
-      };
+  // Focus the editor once the setup dialog is dismissed
+  React.useEffect(() => {
+    if (!showSetup && editor && !editor.isDestroyed) editor.commands.focus();
+  }, [showSetup, editor]);
 
-      editorRef.current.addEventListener('input', handleInput);
-      editorRef.current.addEventListener('keyup', handleInput);
+  // Dialog shortcuts (import, find, link…) would open dialogs hidden underneath
+  useSuppressDialogShortcuts(true);
 
-      return () => {
-        editorRef.current?.removeEventListener('input', handleInput);
-        editorRef.current?.removeEventListener('keyup', handleInput);
-      };
-    }
+  // --- typewriter mode: keep the caret line vertically centred in the scroller ---
+  centerCaretRef.current = () => {
+    requestAnimationFrame(() => {
+      const scroller = scrollRef.current;
+      if (!editor || editor.isDestroyed || !scroller) return;
+      let caret: { top: number; bottom: number };
+      try {
+        caret = editor.view.coordsAtPos(editor.state.selection.head);
+      } catch {
+        return;
+      }
+      const box = scroller.getBoundingClientRect();
+      const offset = (caret.top + caret.bottom) / 2 - (box.top + box.height / 2);
+      if (Math.abs(offset) > 2) scroller.scrollBy({ top: offset, behavior: Math.abs(offset) > 120 ? 'smooth' : 'auto' });
+    });
+  };
+  React.useEffect(() => {
+    if (typewriterMode) centerCaretRef.current();
   }, [typewriterMode]);
 
-  // Ambiance audio handling
+  // --- ambiance: tracks live in IndexedDB, object URLs are recreated on load ---
   React.useEffect(() => {
-    const activeTrack = playlist.find(t => t.id === activeTrackId);
-
-    if (activeTrack) {
-      if (!audioRef.current) {
-        audioRef.current = new Audio();
-        audioRef.current.src = activeTrack.url;
-        audioRef.current.loop = true;
-        audioRef.current.volume = ambianceVolume;
-        audioRef.current.play().catch(() => {
-          console.log('Audio playback failed - user interaction may be required');
-        });
-      } else if (audioRef.current.src !== activeTrack.url) {
-        // Track changed, update src and restart
-        audioRef.current.src = activeTrack.url;
-        audioRef.current.play().catch(() => {
-          console.log('Audio playback failed - user interaction may be required');
-        });
+    let cancelled = false;
+    const created: string[] = [];
+    (async () => {
+      let saved: Array<{ id: string; name: string }> = [];
+      try {
+        saved = JSON.parse(readLS(PLAYLIST_KEY) || '[]');
+      } catch {
+        saved = [];
       }
-    } else {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current = null;
+      const tracks: Track[] = [];
+      for (const item of Array.isArray(saved) ? saved : []) {
+        if (!item?.id) continue;
+        const blob = await getBlob(blobKey(item.id)).catch(() => undefined);
+        if (!blob) continue; // legacy blob: URLs from older versions cannot be recovered
+        const url = URL.createObjectURL(blob);
+        created.push(url);
+        tracks.push({ id: item.id, name: String(item.name || ''), url });
       }
-    }
-
+      if (cancelled) {
+        created.forEach(u => URL.revokeObjectURL(u));
+        return;
+      }
+      playlistLoaded.current = true;
+      // keep tracks uploaded while the saved ones were loading
+      setPlaylist(prev => [...tracks, ...prev.filter(p => !tracks.some(tr => tr.id === p.id))]);
+      const savedActive = readLS(ACTIVE_TRACK_KEY);
+      if (savedActive && tracks.some(tr => tr.id === savedActive)) setActiveTrackId(savedActive);
+    })();
     return () => {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current = null;
-      }
+      cancelled = true;
     };
-  }, [activeTrackId, playlist]);
+  }, []);
+
+  // Revoke object URLs when focus mode closes
+  const playlistRef = React.useRef(playlist);
+  playlistRef.current = playlist;
+  React.useEffect(() => () => playlistRef.current.forEach(tr => URL.revokeObjectURL(tr.url)), []);
+
+  // Persist playlist metadata (never the object URLs)
+  React.useEffect(() => {
+    if (!playlistLoaded.current) return;
+    writeLS(PLAYLIST_KEY, JSON.stringify(playlist.map(({ id, name }) => ({ id, name }))));
+  }, [playlist]);
+
+  React.useEffect(() => {
+    if (!playlistLoaded.current) return;
+    writeLS(ACTIVE_TRACK_KEY, activeTrackId);
+  }, [activeTrackId]);
+
+  // A single Audio element for the whole session
+  const activeUrl = playlist.find(tr => tr.id === activeTrackId)?.url || null;
+  React.useEffect(() => {
+    if (!activeUrl) {
+      audioRef.current?.pause();
+      return;
+    }
+    if (!audioRef.current) {
+      audioRef.current = new Audio();
+      audioRef.current.loop = true;
+    }
+    const audio = audioRef.current;
+    audio.volume = ambianceVolume;
+    if (audio.src !== activeUrl) audio.src = activeUrl;
+    audio.play().catch(() => {
+      /* playback may need a user gesture */
+    });
+  }, [activeUrl]);
+
+  // Stop audio on exit
+  React.useEffect(() => () => {
+    const audio = audioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+    }
+    audioRef.current = null;
+  }, []);
 
   // Update volume without restarting playback
   React.useEffect(() => {
-    if (audioRef.current) {
-      audioRef.current.volume = ambianceVolume;
-    }
+    if (audioRef.current) audioRef.current.volume = ambianceVolume;
   }, [ambianceVolume]);
 
-  // Save playlist to localStorage whenever it changes
-  React.useEffect(() => {
-    localStorage.setItem('penko_ambiance_playlist', JSON.stringify(playlist));
-  }, [playlist]);
-
-  // Save active track ID to localStorage whenever it changes
-  React.useEffect(() => {
-    if (activeTrackId) {
-      localStorage.setItem('penko_active_track_id', activeTrackId);
-    } else {
-      localStorage.removeItem('penko_active_track_id');
-    }
-  }, [activeTrackId]);
-
   // Handle track upload
-  const handleTrackUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleTrackUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    if (fileInputRef.current) fileInputRef.current.value = '';
     if (!file) return;
 
-    // Validate file type
-    const validTypes = ['audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/ogg', 'audio/m4a'];
+    const validTypes = ['audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/ogg', 'audio/m4a', 'audio/mp4', 'audio/x-m4a'];
     if (!validTypes.includes(file.type) && !file.name.match(/\.(mp3|wav|ogg|m4a)$/i)) {
-      alert('Please upload a valid audio file (MP3, WAV, OGG, or M4A)');
+      toast.error(t(uiLanguage, 'invalidAudioFile'));
       return;
     }
 
-    // Create object URL for the file
-    const url = URL.createObjectURL(file);
-    const name = file.name.replace(/\.[^/.]+$/, ''); // Remove extension
-    const id = Date.now().toString();
-
-    // Add to playlist
-    const newTrack = { id, name, url };
-    setPlaylist(prev => [...prev, newTrack]);
-
-    // Auto-select the newly uploaded track
-    setActiveTrackId(id);
-
-    // Reset input
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
+    const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+    try {
+      await putBlob(blobKey(id), file);
+    } catch {
+      toast.error(t(uiLanguage, 'audioSaveFailed'));
+      return;
     }
+    playlistLoaded.current = true;
+    const url = URL.createObjectURL(file);
+    const name = file.name.replace(/\.[^/.]+$/, '');
+    setPlaylist(prev => [...prev, { id, name, url }]);
+    setActiveTrackId(id);
   };
 
   const handleDeleteTrack = (trackId: string) => {
-    const track = playlist.find(t => t.id === trackId);
-
-    // Revoke the object URL to free memory
+    const track = playlist.find(tr => tr.id === trackId);
+    if (activeTrackId === trackId) setActiveTrackId(null);
+    setPlaylist(prev => prev.filter(tr => tr.id !== trackId));
+    void deleteBlob(blobKey(trackId)).catch(() => {});
     if (track) {
-      URL.revokeObjectURL(track.url);
-    }
-
-    // Remove from playlist
-    setPlaylist(prev => prev.filter(t => t.id !== trackId));
-
-    // Deselect if it was active
-    if (activeTrackId === trackId) {
-      setActiveTrackId(null);
+      // Revoke after the audio element let go of it
+      window.setTimeout(() => URL.revokeObjectURL(track.url), 0);
     }
   };
 
@@ -224,18 +380,18 @@ export const FocusMode: React.FC<FocusModeProps> = ({
           }`}>
             <h2 className="text-xl font-bold mb-1 flex items-center gap-2">
               <Target className="text-blue-500" />
-              Enter Zen Space
+              {t(uiLanguage, 'enterZenSpace')}
             </h2>
-            <p className="text-xs opacity-60 mb-6 font-medium">Choose your focus objectives to block distractions.</p>
+            <p className="text-xs opacity-60 mb-6 font-medium">{t(uiLanguage, 'zenSetupHint')}</p>
 
             <div className="space-y-4 mb-6">
               <div>
-                <label className="text-xs font-semibold block mb-1.5">Word Objective (Words)</label>
+                <label className="text-xs font-semibold block mb-1.5">{t(uiLanguage, 'wordObjective')}</label>
                 <input
                   type="number"
                   value={tempGoal}
                   onChange={(e) => setTempGoal(e.target.value)}
-                  placeholder="e.g. 500 (Leave empty for none)"
+                  placeholder={t(uiLanguage, 'wordObjectivePlaceholder')}
                   className={`w-full text-sm p-3 rounded-xl border focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all ${
                     darkMode ? 'bg-zinc-950 border-zinc-800 text-gray-200' : 'bg-gray-50 border-gray-200'
                   }`}
@@ -246,13 +402,14 @@ export const FocusMode: React.FC<FocusModeProps> = ({
                 <div className="flex items-center gap-2">
                   <Clock size={16} className="text-blue-500" />
                   <div>
-                    <div className="text-xs font-semibold">Enable Pomodoro Timer</div>
-                    <div className="text-[10px] opacity-60">Focus in 25-minute intervals</div>
+                    <div className="text-xs font-semibold">{t(uiLanguage, 'enablePomodoro')}</div>
+                    <div className="text-[10px] opacity-60">{t(uiLanguage, 'enablePomodoroHint')}</div>
                   </div>
                 </div>
                 <input
                   type="checkbox"
                   checked={enableTimer}
+                  aria-label={t(uiLanguage, 'enablePomodoro')}
                   onChange={(e) => setEnableTimer(e.target.checked)}
                   className="accent-blue-600 w-4 h-4 cursor-pointer"
                 />
@@ -264,27 +421,28 @@ export const FocusMode: React.FC<FocusModeProps> = ({
                 onClick={onExit}
                 className="flex-1 py-3 rounded-xl border text-xs font-semibold hover:bg-black/5 dark:hover:bg-white/5 transition-all text-center"
               >
-                Cancel
+                {t(uiLanguage, 'cancel')}
               </button>
               <button
                 onClick={() => {
-                  const goalNum = parseInt(tempGoal);
-                  onSetWordGoal(isNaN(goalNum) ? undefined : goalNum);
-                  if (goalNum > 0) setShowWordGoal(true);
+                  const goalNum = parseInt(tempGoal, 10);
+                  const goal = goalNum > 0 ? goalNum : undefined;
+                  onSetWordGoal(goal);
+                  if (goal) setShowWordGoal(true);
                   if (enableTimer) setShowPomodoro(true);
                   setShowSetup(false);
                 }}
                 className="flex-1 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold transition-all shadow-md text-center"
               >
-                Enter Zen Space
+                {t(uiLanguage, 'enterZenSpace')}
               </button>
             </div>
           </div>
         </div>
       )}
       {/* Top Toolbar */}
-      <div className={`${toolbarBg} backdrop-blur-sm border-b ${darkMode ? 'border-gray-800' : 'border-gray-200'} px-6 py-3 flex items-center justify-between`}>
-        <div className="flex items-center gap-4">
+      <div className={`${toolbarBg} backdrop-blur-sm border-b ${darkMode ? 'border-gray-800' : 'border-gray-200'} px-3 sm:px-6 py-3 flex items-center justify-between gap-2`}>
+        <div className="flex items-center gap-1 sm:gap-4 min-w-0">
           <button
             onClick={onExit}
             className={`p-2 rounded-lg transition-colors ${buttonHover}`}
@@ -336,7 +494,7 @@ export const FocusMode: React.FC<FocusModeProps> = ({
           </button>
         </div>
 
-        <div className="text-sm opacity-60">
+        <div className="text-sm opacity-60 shrink-0 whitespace-nowrap">
           {wordCount} {t(uiLanguage, 'words')}
         </div>
       </div>
@@ -353,43 +511,43 @@ export const FocusMode: React.FC<FocusModeProps> = ({
       )}
 
       {/* Main Editor Area */}
-      <div className="flex-1 overflow-y-auto flex justify-center relative">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto flex justify-center relative">
         {isOnStrictBreak && (
           <div className="absolute inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-10">
             <div className={`${darkMode ? 'bg-gray-800' : 'bg-white'} px-8 py-6 rounded-xl shadow-2xl text-center`}>
               <div className="text-4xl mb-3">☕</div>
-              <div className="text-xl font-semibold mb-2">Break Time!</div>
-              <div className="text-sm opacity-60">Take a rest. Writing is disabled during break.</div>
+              <div className="text-xl font-semibold mb-2">{t(uiLanguage, 'breakTimeTitle')}</div>
+              <div className="text-sm opacity-60">{t(uiLanguage, 'breakTimeHint')}</div>
             </div>
           </div>
         )}
-        <div
-          ref={editorRef}
-          contentEditable={!isOnStrictBreak}
-          suppressContentEditableWarning
-          onInput={(e) => {
-            if (!isUpdatingRef.current && !isOnStrictBreak) {
-              onChange(e.currentTarget.innerHTML);
-            }
+        <EditorContent
+          editor={editor}
+          lang={currentDoc?.language || 'en-US'}
+          spellCheck
+          onClick={e => {
+            if (e.target === e.currentTarget && editor && !isOnStrictBreak) editor.commands.focus('end');
           }}
           className={`
-            w-full max-w-4xl px-12 py-16 outline-none
-            ${typewriterMode ? 'pt-[50vh]' : ''}
+            penko-doc w-full max-w-4xl px-12 py-16 outline-none
+            ${typewriterMode ? 'pt-[50vh] pb-[50vh] self-start' : ''}
             ${isOnStrictBreak ? 'pointer-events-none opacity-50' : ''}
+            ${currentDoc?.isScreenplay ? 'screenplay-mode' : ''}
+            ${darkMode ? 'penko-doc-dark' : ''}
             focus:outline-none
             prose prose-lg dark:prose-invert max-w-none
           `}
           style={{
             fontSize: '16px',
             lineHeight: '1.8',
-            fontFamily: darkMode ? 'Georgia, serif' : 'Georgia, serif',
+            fontFamily: 'Georgia, serif',
             minHeight: typewriterMode ? '200vh' : 'auto',
           }}
         />
       </div>
 
       {/* Bottom Widgets */}
-      <div className="absolute bottom-6 right-6 flex flex-col gap-3 items-end">
+      <div className="absolute bottom-6 right-6 z-20 flex flex-col gap-3 items-end">
         {/* Pomodoro Timer */}
         {showPomodoro && (
           <PomodoroTimer
@@ -430,7 +588,8 @@ export const FocusMode: React.FC<FocusModeProps> = ({
                         className={`absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded transition-colors ${
                           darkMode ? 'hover:bg-red-500/20 text-red-400' : 'hover:bg-red-50 text-red-600'
                         }`}
-                        title="Delete track"
+                        title={t(uiLanguage, 'deleteTrack')}
+                        aria-label={t(uiLanguage, 'deleteTrack')}
                       >
                         <X size={14} />
                       </button>
@@ -446,7 +605,7 @@ export const FocusMode: React.FC<FocusModeProps> = ({
                   darkMode ? 'border-gray-600 hover:border-blue-500 hover:bg-blue-500/10' : 'border-gray-300 hover:border-blue-400 hover:bg-blue-50'
                 }`}
               >
-                ➕ Upload Track
+                ➕ {t(uiLanguage, 'uploadTrack')}
               </button>
 
               {/* Hidden file input */}
@@ -454,7 +613,7 @@ export const FocusMode: React.FC<FocusModeProps> = ({
                 ref={fileInputRef}
                 type="file"
                 accept="audio/*,.mp3,.wav,.ogg,.m4a"
-                onChange={handleTrackUpload}
+                onChange={e => void handleTrackUpload(e)}
                 className="hidden"
               />
 

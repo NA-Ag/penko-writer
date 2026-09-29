@@ -60,6 +60,9 @@ export interface DocumentData {
   header?: string;
   footer?: string;
   showPageNumbers?: boolean;
+  /** Hide the header/footer on the first page (title pages). */
+  differentFirstPage?: boolean;
+  pageNumberFormat?: 'decimal' | 'roman' | 'page-of';
   pageNumberPosition?: 'header-left' | 'header-center' | 'header-right' | 'footer-left' | 'footer-center' | 'footer-right';
   comments?: Comment[];
   trackChanges?: TrackChange[];
@@ -69,6 +72,35 @@ export interface DocumentData {
   citations?: Citation[];
   isScreenplay?: boolean; // Enables screenplay editing mode
   isMarkdownMode?: boolean; // Enables markdown editing mode
+  markdownSource?: string; // Exact markdown text while in markdown mode
+  /** Named paragraph styles: changed built-ins and custom styles (missing = defaults, see utils/paragraphStyles.ts). */
+  styles?: ParagraphStyle[];
+}
+
+export type StyleAlign = 'left' | 'center' | 'right' | 'justify';
+
+/**
+ * A named paragraph style (Word's "Normal", "Heading 1"…). Sizes and spacing
+ * are in pt; `null` colour means automatic (follows the theme).
+ */
+export interface ParagraphStyle {
+  id: string;
+  name: string;
+  /** Block the style produces. Headings keep their level (TOC / outline). */
+  kind: 'paragraph' | 'heading' | 'quote' | 'code';
+  level?: number;
+  fontFamily?: string | null;
+  fontSize?: number | null;
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  color?: string | null;
+  align?: StyleAlign;
+  lineHeight?: number | null;
+  spaceBefore?: number | null;
+  spaceAfter?: number | null;
+  /** left indent */
+  indent?: number | null;
 }
 
 export interface PageConfig {

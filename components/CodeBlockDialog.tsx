@@ -1,67 +1,57 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { X, Check, Code2, Copy, Download } from 'lucide-react';
-import Prism from 'prismjs';
-import 'prismjs/themes/prism-tomorrow.css';
+import type { Editor } from '@tiptap/core';
+import Prism from '../editor/prism';
 import { t, LanguageCode } from '../utils/translations';
-
-// Import common language support (order matters - dependencies must be loaded first)
-import 'prismjs/components/prism-clike'; // Required for C, C++, Java, C#, etc.
-import 'prismjs/components/prism-c';
-import 'prismjs/components/prism-cpp';
-import 'prismjs/components/prism-java';
-import 'prismjs/components/prism-csharp';
-import 'prismjs/components/prism-javascript';
-import 'prismjs/components/prism-typescript';
-import 'prismjs/components/prism-python';
-import 'prismjs/components/prism-php';
-import 'prismjs/components/prism-ruby';
-import 'prismjs/components/prism-go';
-import 'prismjs/components/prism-rust';
-import 'prismjs/components/prism-sql';
-import 'prismjs/components/prism-bash';
-import 'prismjs/components/prism-json';
-import 'prismjs/components/prism-yaml';
-import 'prismjs/components/prism-markdown';
-import 'prismjs/components/prism-css';
-import 'prismjs/components/prism-markup'; // HTML/XML
+import { useApp } from '../AppContext';
+import { useFocusTrap } from '../utils/hooks';
 
 interface CodeBlockDialogProps {
   isOpen: boolean;
   onClose: () => void;
-  onInsert: (code: string, language: string, theme: string) => void;
+  onInsert: (code: string, language: string, theme: string, lineNumbers?: boolean) => void;
   darkMode: boolean;
-  existingCode?: { code: string; language: string };
   uiLanguage: LanguageCode;
 }
 
-const LANGUAGES = [
-  { value: 'javascript', label: 'JavaScript' },
-  { value: 'typescript', label: 'TypeScript' },
-  { value: 'python', label: 'Python' },
-  { value: 'java', label: 'Java' },
-  { value: 'cpp', label: 'C++' },
-  { value: 'c', label: 'C' },
-  { value: 'csharp', label: 'C#' },
-  { value: 'php', label: 'PHP' },
-  { value: 'ruby', label: 'Ruby' },
-  { value: 'go', label: 'Go' },
-  { value: 'rust', label: 'Rust' },
-  { value: 'sql', label: 'SQL' },
-  { value: 'bash', label: 'Bash/Shell' },
-  { value: 'json', label: 'JSON' },
-  { value: 'yaml', label: 'YAML' },
-  { value: 'markdown', label: 'Markdown' },
-  { value: 'css', label: 'CSS' },
-  { value: 'html', label: 'HTML' },
-  { value: 'plaintext', label: 'Plain Text' },
+/** `ext` is the file extension used by "Download". */
+const CODE_LANGUAGES = [
+  { value: 'javascript', label: 'JavaScript', ext: 'js' },
+  { value: 'typescript', label: 'TypeScript', ext: 'ts' },
+  { value: 'python', label: 'Python', ext: 'py' },
+  { value: 'java', label: 'Java', ext: 'java' },
+  { value: 'cpp', label: 'C++', ext: 'cpp' },
+  { value: 'c', label: 'C', ext: 'c' },
+  { value: 'csharp', label: 'C#', ext: 'cs' },
+  { value: 'php', label: 'PHP', ext: 'php' },
+  { value: 'ruby', label: 'Ruby', ext: 'rb' },
+  { value: 'go', label: 'Go', ext: 'go' },
+  { value: 'rust', label: 'Rust', ext: 'rs' },
+  { value: 'sql', label: 'SQL', ext: 'sql' },
+  { value: 'bash', label: 'Bash/Shell', ext: 'sh' },
+  { value: 'json', label: 'JSON', ext: 'json' },
+  { value: 'yaml', label: 'YAML', ext: 'yaml' },
+  { value: 'markdown', label: 'Markdown', ext: 'md' },
+  { value: 'css', label: 'CSS', ext: 'css' },
+  { value: 'html', label: 'HTML', ext: 'html' },
+  { value: 'plaintext', label: '', ext: 'txt' },
 ];
 
 const THEMES = [
-  { value: 'tomorrow-night', label: 'Dark (Tomorrow Night)' },
-  { value: 'solarized-light', label: 'Light (Solarized)' },
-  { value: 'github', label: 'GitHub' },
-  { value: 'dracula', label: 'Dracula' },
+  { value: 'tomorrow-night', labelKey: 'themeDark' },
+  { value: 'github', labelKey: 'themeLight' },
 ];
+
+/** The code block containing the cursor, if any (so the dialog edits it instead of nesting a new one). */
+const codeBlockAtSelection = (editor: Editor | null) => {
+  if (!editor || editor.isDestroyed) return null;
+  const { $from } = editor.state.selection;
+  for (let d = $from.depth; d > 0; d--) {
+    const node = $from.node(d);
+    if (node.type.name === 'codeBlock') return { pos: $from.before(d), node };
+  }
+  return null;
+};
 
 const SAMPLE_CODE: { [key: string]: string } = {
   javascript: `function fibonacci(n) {\n  if (n <= 1) return n;\n  return fibonacci(n - 1) + fibonacci(n - 2);\n}\n\nconsole.log(fibonacci(10));`,
@@ -76,70 +66,106 @@ const CodeBlockDialog: React.FC<CodeBlockDialogProps> = ({
   onClose,
   onInsert,
   darkMode,
-  existingCode,
   uiLanguage,
 }) => {
-  const [code, setCode] = useState(existingCode?.code || '');
-  const [language, setLanguage] = useState(existingCode?.language || 'javascript');
+  const [code, setCode] = useState('');
+  const [language, setLanguage] = useState('javascript');
   const [theme, setTheme] = useState('tomorrow-night');
   const [showLineNumbers, setShowLineNumbers] = useState(true);
-  const previewRef = useRef<HTMLPreElement>(null);
+  // Position of the code block being edited (cursor was inside one when the dialog opened)
+  const [editingPos, setEditingPos] = useState<number | null>(null);
+  const { toast, editor } = useApp();
+  const dialogRef = useFocusTrap<HTMLDivElement>(isOpen);
+  const previewRef = useRef<HTMLElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    if (existingCode) {
-      setCode(existingCode.code);
-      setLanguage(existingCode.language);
-    }
-  }, [existingCode]);
-
-  useEffect(() => {
     if (!isOpen) {
-      if (!existingCode) {
-        setCode('');
-        setLanguage('javascript');
-      }
+      setCode('');
+      setLanguage('javascript');
       setTheme('tomorrow-night');
       setShowLineNumbers(true);
+      setEditingPos(null);
+      return;
     }
-  }, [isOpen, existingCode]);
+    const found = codeBlockAtSelection(editor);
+    if (found) {
+      setEditingPos(found.pos);
+      setCode(found.node.textContent);
+      setLanguage(found.node.attrs.language || 'plaintext');
+      setTheme(found.node.attrs.theme === 'light' ? 'github' : 'tomorrow-night');
+      setShowLineNumbers(found.node.attrs.lineNumbers !== false);
+    }
+    // Only when the dialog opens
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
 
   useEffect(() => {
-    if (previewRef.current && code) {
+    const el = previewRef.current;
+    if (!el) return;
+    const grammar = language !== 'plaintext' ? Prism.languages[language] : undefined;
+    if (code && grammar) {
       try {
-        const highlighted = language === 'plaintext'
-          ? code
-          : Prism.highlight(code, Prism.languages[language] || Prism.languages.plaintext, language);
-
-        previewRef.current.innerHTML = highlighted;
-      } catch (err) {
-        previewRef.current.textContent = code;
+        // Prism escapes the source; its output is only markup for tokens
+        el.innerHTML = Prism.highlight(code, grammar, language);
+        return;
+      } catch {
+        /* fall through to plain text */
       }
-    } else if (previewRef.current) {
-      previewRef.current.textContent = 'Preview will appear here...';
     }
-  }, [code, language]);
+    el.textContent = code || t(uiLanguage, 'previewPlaceholder');
+  }, [code, language, isOpen, uiLanguage]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [isOpen, onClose]);
 
   const handleInsert = () => {
-    if (code.trim()) {
-      onInsert(code.trim(), language, theme);
-      onClose();
+    if (!code.trim()) return;
+    const text = code.replace(/\s+$/, '');
+    const existing = editingPos !== null && editor && !editor.isDestroyed ? editor.state.doc.nodeAt(editingPos) : null;
+    if (existing?.type.name === 'codeBlock' && editor) {
+      const { schema } = editor.state;
+      editor
+        .chain()
+        .focus()
+        .command(({ tr }) => {
+          const attrs = { ...existing.attrs, language, theme: theme === 'github' ? 'light' : 'dark', lineNumbers: showLineNumbers };
+          tr.replaceWith(editingPos!, editingPos! + existing.nodeSize, schema.nodes.codeBlock.create(attrs, schema.text(text)));
+          return true;
+        })
+        .run();
+    } else {
+      onInsert(text, language, theme, showLineNumbers);
     }
+    onClose();
   };
 
   const handleLoadSample = () => {
-    const sample = SAMPLE_CODE[language] || SAMPLE_CODE.plaintext;
+    const sample = SAMPLE_CODE[language] || t(uiLanguage, 'codeSamplePlain');
     setCode(sample);
     textareaRef.current?.focus();
   };
 
-  const handleCopyCode = () => {
-    navigator.clipboard.writeText(code);
-    alert('Code copied to clipboard!');
+  const handleCopyCode = async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      toast.success(t(uiLanguage, 'codeCopied'));
+    } catch {
+      toast.error(t(uiLanguage, 'copyFailed'));
+    }
   };
 
   const handleDownloadCode = () => {
-    const ext = language === 'plaintext' ? 'txt' : language;
+    const ext = CODE_LANGUAGES.find(l => l.value === language)?.ext || 'txt';
     const blob = new Blob([code], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -149,13 +175,14 @@ const CodeBlockDialog: React.FC<CodeBlockDialogProps> = ({
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
+    toast.success(t(uiLanguage, 'codeDownloaded'));
   };
 
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 backdrop-blur-sm p-4">
-      <div className={`
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 backdrop-blur-sm p-4" role="dialog" aria-modal="true" aria-labelledby="codeblock-dialog-title">
+      <div ref={dialogRef} className={`
         max-w-5xl w-full rounded-2xl shadow-2xl overflow-hidden max-h-[90vh] flex flex-col
         ${darkMode ? 'bg-[#1e1e1e]' : 'bg-white'}
       `}>
@@ -163,6 +190,7 @@ const CodeBlockDialog: React.FC<CodeBlockDialogProps> = ({
         <div className="bg-gradient-to-r from-cyan-600 to-blue-600 p-6 text-white relative flex-shrink-0">
           <button
             onClick={onClose}
+            aria-label={t(uiLanguage, 'close')}
             className="absolute top-4 right-4 text-white/80 hover:text-white transition-colors"
           >
             <X className="w-6 h-6" />
@@ -173,7 +201,7 @@ const CodeBlockDialog: React.FC<CodeBlockDialogProps> = ({
               <Code2 className="w-6 h-6" />
             </div>
             <div>
-              <h2 className="text-xl font-bold">{t(uiLanguage, 'insertCodeBlock')}</h2>
+              <h2 id="codeblock-dialog-title" className="text-xl font-bold">{editingPos !== null ? t(uiLanguage, 'editCodeBlock') : t(uiLanguage, 'insertCodeBlock')}</h2>
               <p className="text-cyan-100 text-sm">{t(uiLanguage, 'syntaxHighlightedCode')}</p>
             </div>
           </div>
@@ -184,10 +212,11 @@ const CodeBlockDialog: React.FC<CodeBlockDialogProps> = ({
           {/* Language and Theme Selection */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
             <div>
-              <label className={`block text-sm font-medium mb-2 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+              <label htmlFor="codeblock-language" className={`block text-sm font-medium mb-2 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
                 {t(uiLanguage, 'programmingLanguage')}
               </label>
               <select
+                id="codeblock-language"
                 value={language}
                 onChange={(e) => setLanguage(e.target.value)}
                 className={`
@@ -199,8 +228,29 @@ const CodeBlockDialog: React.FC<CodeBlockDialogProps> = ({
                   border-2 focus:border-cyan-500 outline-none
                 `}
               >
-                {LANGUAGES.map(lang => (
-                  <option key={lang.value} value={lang.value}>{lang.label}</option>
+                {!CODE_LANGUAGES.some(l => l.value === language) && <option value={language}>{language}</option>}
+                {CODE_LANGUAGES.map(lang => (
+                  <option key={lang.value} value={lang.value}>{lang.value === 'plaintext' ? t(uiLanguage, 'plainText') : lang.label}</option>
+                ))}
+              </select>
+              <label htmlFor="codeblock-theme" className={`block text-sm font-medium mb-2 mt-4 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                {t(uiLanguage, 'codeTheme')}
+              </label>
+              <select
+                id="codeblock-theme"
+                value={theme}
+                onChange={(e) => setTheme(e.target.value)}
+                className={`
+                  w-full px-4 py-2 rounded-lg font-medium
+                  ${darkMode
+                    ? 'bg-gray-800 text-white border-gray-700'
+                    : 'bg-gray-50 text-gray-900 border-gray-300'
+                  }
+                  border-2 focus:border-cyan-500 outline-none
+                `}
+              >
+                {THEMES.map(th => (
+                  <option key={th.value} value={th.value}>{t(uiLanguage, th.labelKey)}</option>
                 ))}
               </select>
             </div>
@@ -279,9 +329,11 @@ const CodeBlockDialog: React.FC<CodeBlockDialogProps> = ({
             </div>
             <textarea
               ref={textareaRef}
+              data-autofocus
+              aria-label={t(uiLanguage, 'codeEditor')}
               value={code}
               onChange={(e) => setCode(e.target.value)}
-              placeholder={t(uiLanguage, 'enterCodePlaceholder').replace('{language}', LANGUAGES.find(l => l.value === language)?.label || t(uiLanguage, 'plainText'))}
+              placeholder={t(uiLanguage, 'enterCodePlaceholder').replace('{language}', (language !== 'plaintext' && (CODE_LANGUAGES.find(l => l.value === language)?.label || language)) || t(uiLanguage, 'plainText'))}
               rows={12}
               className={`
                 w-full px-4 py-3 rounded-lg font-mono text-sm
@@ -352,7 +404,7 @@ const CodeBlockDialog: React.FC<CodeBlockDialogProps> = ({
             `}
           >
             <Check className="w-5 h-5" />
-            {t(uiLanguage, 'insertCodeBlock')}
+            {editingPos !== null ? t(uiLanguage, 'update') : t(uiLanguage, 'insertCodeBlock')}
           </button>
         </div>
       </div>

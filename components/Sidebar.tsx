@@ -1,13 +1,31 @@
 import React, { useState } from 'react';
 import { DocumentData } from '../types';
 import {
-  Plus, Download, Printer, Save, FolderOpen, History,
-  FileDown, LayoutTemplate, Settings, Moon, Sun, ChevronDown, Upload, X, Users
+  Plus, Download, Save, FolderOpen, History,
+  LayoutTemplate, Settings, Moon, Sun, ChevronDown, Upload, X, Users, FileDown, SaveAll, RefreshCw
 } from 'lucide-react';
-import { exportToDoc, exportToDocx, exportToPdf, exportToTxt, exportToHtml, exportToMarkdown, exportAllDocuments } from '../utils/export';
-import { importArchive } from '../utils/import';
+import { setSyncDialogOpen } from '../utils/sync/status';
+import { useFiles } from '../state/FilesContext';
+import { RecentFiles } from './files/RecentFiles';
+import type * as ImportModule from '../utils/import';
 import { LanguageCode, t } from '../utils/translations';
 import { PenkoIcon } from './PenkoIcon';
+import { useApp } from '../AppContext';
+import { useExportAll } from '../utils/useExportAll';
+import { useExportDocument, type ExportFormat } from '../utils/useExportDocument';
+
+// Export/import code (jspdf, docx, mammoth, jszip…) is code-split and only
+// downloaded the first time one of these actions is used.
+const importArchive: typeof ImportModule.importArchive = async (...a) => (await import('../utils/import')).importArchive(...a);
+
+const EXPORT_FORMATS: { format: ExportFormat; label: string }[] = [
+  { format: 'doc', label: 'exportAsDocWord' },
+  { format: 'docx', label: 'exportAsDocx' },
+  { format: 'pdf', label: 'exportAsPdf' },
+  { format: 'html', label: 'exportAsHtml' },
+  { format: 'txt', label: 'exportAsTxt' },
+  { format: 'md', label: 'exportAsMarkdown' },
+];
 
 interface SidebarProps {
   isOpen: boolean;
@@ -63,6 +81,7 @@ const RailButton: React.FC<{
       onClick={onClick}
       className={`w-16 h-16 py-1.5 flex flex-col items-center justify-center rounded-xl transition-all relative group ${active ? activeClass : inactiveClass}`}
       title={label}
+      aria-pressed={active}
     >
       <div className="scale-95">{icon}</div>
       <span className="text-xs font-semibold leading-tight mt-0.5 max-w-full overflow-hidden truncate px-0.5">{label.split(' ')[0]}</span>
@@ -85,10 +104,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [confirmingRemove, setConfirmingRemove] = useState<string | null>(null);
   const [mascotPose, setMascotPose] = useState<'idle' | 'talk' | 'hurt' | 'jump' | 'walk'>('idle');
   const archiveInputRef = React.useRef<HTMLInputElement>(null);
+  const { toast, handleCreateDocument } = useApp();
+  const exportAll = useExportAll();
+  const files = useFiles();
+  const documentIds = React.useMemo(() => new Set(documents.map(d => d.id)), [documents]);
 
-  const handleExportAll = async () => {
-    await exportAllDocuments(documents);
+
+  const exportDocument = useExportDocument();
+  const handleExport = (format: ExportFormat) => {
     setShowExportMenu(false);
+    void exportDocument(format);
+  };
+
+
+  const handleExportAll = () => {
+    setShowExportMenu(false);
+    void exportAll();
   };
 
   const handleImportArchive = () => {
@@ -97,30 +128,37 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   const handleArchiveFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    // Reset input so the same file can be picked again
+    if (archiveInputRef.current) archiveInputRef.current.value = '';
     if (!file) return;
+    setShowExportMenu(false);
 
-    const result = await importArchive(file);
-    if (result.success && result.documents.length > 0) {
-      // We need to pass this back to App.tsx to add to documents
-      // For now, store in localStorage directly
-      const existingDocs = JSON.parse(localStorage.getItem('penko_writer_docs') || '[]');
-      const updatedDocs = [...existingDocs, ...result.documents];
-      localStorage.setItem('penko_writer_docs', JSON.stringify(updatedDocs));
-
-      alert(`Successfully imported ${result.documents.length} document(s). Please refresh the page to see them.`);
-      window.location.reload();
-    } else {
-      alert(result.error || 'Failed to import archive');
+    let result: Awaited<ReturnType<typeof importArchive>>;
+    try {
+      result = await importArchive(file, uiLanguage);
+    } catch (error) {
+      console.error('[Import] Archive import failed:', error);
+      result = { success: false, documents: [], skipped: 0 };
     }
-
-    // Reset input
-    if (archiveInputRef.current) {
-      archiveInputRef.current.value = '';
+    if (result.success && result.documents.length > 0) {
+      // fresh ids are generated for every restored document (no duplicates)
+      result.documents.forEach(doc => handleCreateDocument(doc, { select: false }));
+      const count = String(result.documents.length);
+      toast.success(
+        result.skipped
+          ? t(uiLanguage, 'archiveImportedWithSkipped').replace('{count}', count).replace('{skipped}', String(result.skipped))
+          : t(uiLanguage, 'archiveImported').replace('{count}', count),
+      );
+    } else {
+      toast.error(result.error || t(uiLanguage, 'archiveInvalid'));
     }
   };
+  const mascotTimer = React.useRef(0);
+  React.useEffect(() => () => window.clearTimeout(mascotTimer.current), []);
   const handleMascotClick = () => {
     setMascotPose('jump');
-    setTimeout(() => setMascotPose('idle'), 600);
+    window.clearTimeout(mascotTimer.current);
+    mascotTimer.current = window.setTimeout(() => setMascotPose('idle'), 600);
     onShowStats();
   };
 
@@ -138,7 +176,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
                  onMouseEnter={() => setMascotPose('walk')}
                  onMouseLeave={() => setMascotPose('idle')}
                  className="w-12 h-12 transition-all rounded-xl flex items-center justify-center border border-blue-600 dark:border-blue-700 shadow-sm hover:scale-105 active:scale-95 bg-blue-600 hover:bg-blue-700 text-white shadow-lg shadow-blue-500/30"
-                 title="About Penko Writer"
+                 title={t(uiLanguage, 'showStats')}
+                 aria-label={t(uiLanguage, 'showStats')}
               >
                  <PenkoIcon type="writer" size={36} pose={mascotPose} />
               </button>
@@ -171,7 +210,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
            <RailButton
              icon={<Upload size={24} />}
-             label="Import"
+             label={t(uiLanguage, 'import')}
              onClick={onImportDoc}
              darkMode={darkMode}
              theme="indigo"
@@ -183,6 +222,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
              onClick={onShowCollaboration}
              darkMode={darkMode}
              theme="blue"
+           />
+
+           <RailButton
+             icon={<RefreshCw size={24} />}
+             label={t(uiLanguage, 'syncTitle')}
+             onClick={() => setSyncDialogOpen(true)}
+             darkMode={darkMode}
+             theme="teal"
            />
 
            <div className="flex-1"></div>
@@ -207,7 +254,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {/* Expandable Drawer */}
         <div 
           className={`flex flex-col transition-all duration-300 ease-in-out overflow-hidden ${drawerBg}`}
-          style={{ width: isOpen ? '16rem' : '0px', opacity: isOpen ? 1 : 0 }}
+          style={{ width: isOpen ? '16rem' : '0px', opacity: isOpen ? 1 : 0, visibility: isOpen ? 'visible' : 'hidden' }}
+          inert={!isOpen}
         >
             <div className="w-64 flex flex-col h-full"> {/* Inner container to prevent squishing */}
                 <div className="p-5 border-b border-gray-200/10">
@@ -222,16 +270,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     <p className="text-[10px] opacity-50 mt-1">v0.9.5-beta.1 • Feature Complete Release</p>
                 </div>
                 
-                <div className="flex-1 overflow-y-auto p-2">
+                <div className="flex-1 overflow-y-auto p-2" role="list" aria-label={t(uiLanguage, 'documents')}>
                     {documents.map((doc, idx) => (
                       <div 
                         key={doc.id} 
+                        role="listitem"
                         className={`relative group mb-1 ${isOpen ? 'animate-fade-in' : 'opacity-0'}`}
                         style={{ animationDelay: `${idx * 40}ms`, animationFillMode: 'both' }}
                       >
                         <button
                           type="button"
                           onClick={() => onSelectDoc(doc.id)}
+                          aria-current={doc.id === currentDoc?.id ? 'true' : undefined}
                           className={`w-full text-left px-4 py-3 rounded-lg flex flex-col gap-1 transition-all
                             ${doc.id === currentDoc?.id
                               ? (darkMode ? 'bg-white/10 text-white shadow-sm' : 'bg-blue-50 text-blue-700 shadow-sm')
@@ -239,7 +289,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                             }
                           `}
                         >
-                          <span className="font-medium truncate w-full pr-6">{doc.title || 'Untitled Document'}</span>
+                          <span className="font-medium truncate w-full pr-6">{doc.title || t(uiLanguage, 'untitledDocument')}</span>
                           <span className="text-[10px] opacity-60">
                             {new Date(doc.lastModified).toLocaleDateString()}
                           </span>
@@ -299,8 +349,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     ))}
                 </div>
 
+                <RecentFiles darkMode={darkMode} uiLanguage={uiLanguage} documentIds={documentIds} />
+
                 <div className={`p-4 border-t space-y-1 ${darkMode ? 'border-gray-800' : 'border-gray-100'}`}>
                     <DrawerAction icon={<Save size={18} />} label={t(uiLanguage, 'saveNow')} onClick={onSave} darkMode={darkMode} />
+                    <DrawerAction icon={<FolderOpen size={18} />} label={t(uiLanguage, 'openFileEllipsis')} onClick={files.openFile} darkMode={darkMode} />
+                    <DrawerAction icon={<FileDown size={18} />} label={t(uiLanguage, 'saveToFile')} onClick={() => void files.saveToFile()} darkMode={darkMode} />
+                    <DrawerAction icon={<SaveAll size={18} />} label={t(uiLanguage, 'saveAsFile')} onClick={() => void files.saveAs()} darkMode={darkMode} />
                     <DrawerAction icon={<History size={18} />} label={t(uiLanguage, 'history')} onClick={onShowHistory} darkMode={darkMode} />
 
                     {/* Export Menu */}
@@ -315,72 +370,34 @@ export const Sidebar: React.FC<SidebarProps> = ({
                         `}
                       >
                         <Download size={18} />
-                        <span className="flex-1 text-left text-sm">Export Document</span>
+                        <span className="flex-1 text-left text-sm">{t(uiLanguage, 'exportDocument')}</span>
                         <ChevronDown size={16} className={`transition-transform ${showExportMenu ? 'rotate-180' : ''}`} />
                       </button>
 
                       {showExportMenu && (
-                        <div role="menu" className={`mt-1 ml-4 space-y-1 pl-4 border-l-2 ${darkMode ? 'border-gray-700' : 'border-gray-200'}`}>
-                          <button
-                            role="menuitem"
-                            onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => { if (currentDoc) exportToDoc(currentDoc); setShowExportMenu(false); }}
-                            className={`w-full text-left px-4 py-2 rounded-lg text-sm transition-all
-                              ${darkMode ? 'hover:bg-white/10 text-gray-400' : 'hover:bg-gray-100 text-gray-600'}
-                            `}
-                          >
-                            Export as .DOC
-                          </button>
-                          <button
-                            role="menuitem"
-                            onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => { if (currentDoc) exportToDocx(currentDoc); setShowExportMenu(false); }}
-                            className={`w-full text-left px-4 py-2 rounded-lg text-sm transition-all
-                              ${darkMode ? 'hover:bg-white/10 text-gray-400' : 'hover:bg-gray-100 text-gray-600'}
-                            `}
-                          >
-                            {t(uiLanguage, 'exportAsDocx')}
-                          </button>
-                          <button
-                            role="menuitem"
-                            onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => { if (currentDoc) exportToPdf(currentDoc); setShowExportMenu(false); }}
-                            className={`w-full text-left px-4 py-2 rounded-lg text-sm transition-all
-                              ${darkMode ? 'hover:bg-white/10 text-gray-400' : 'hover:bg-gray-100 text-gray-600'}
-                            `}
-                          >
-                            {t(uiLanguage, 'exportAsPdf')}
-                          </button>
-                          <button
-                            role="menuitem"
-                            onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => { if (currentDoc) exportToHtml(currentDoc); setShowExportMenu(false); }}
-                            className={`w-full text-left px-4 py-2 rounded-lg text-sm transition-all
-                              ${darkMode ? 'hover:bg-white/10 text-gray-400' : 'hover:bg-gray-100 text-gray-600'}
-                            `}
-                          >
-                            {t(uiLanguage, 'exportAsHtml')}
-                          </button>
-                          <button
-                            role="menuitem"
-                            onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => { if (currentDoc) exportToTxt(currentDoc); setShowExportMenu(false); }}
-                            className={`w-full text-left px-4 py-2 rounded-lg text-sm transition-all
-                              ${darkMode ? 'hover:bg-white/10 text-gray-400' : 'hover:bg-gray-100 text-gray-600'}
-                            `}
-                          >
-                            {t(uiLanguage, 'exportAsTxt')}
-                          </button>
-                          <button
-                            role="menuitem"
-                            onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => { if (currentDoc) exportToMarkdown(currentDoc); setShowExportMenu(false); }}
-                            className={`w-full text-left px-4 py-2 rounded-lg text-sm transition-all
-                              ${darkMode ? 'hover:bg-white/10 text-gray-400' : 'hover:bg-gray-100 text-gray-600'}
-                            `}
-                          >
-                            {t(uiLanguage, 'exportAsMarkdown')}
-                          </button>
+                        <div
+                          role="menu"
+                          onKeyDown={(e) => {
+                            if (e.key === 'Escape') {
+                              e.stopPropagation();
+                              setShowExportMenu(false);
+                            }
+                          }}
+                          className={`mt-1 ml-4 space-y-1 pl-4 border-l-2 ${darkMode ? 'border-gray-700' : 'border-gray-200'}`}
+                        >
+                          {EXPORT_FORMATS.map(({ format, label }) => (
+                            <button
+                              key={format}
+                              role="menuitem"
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => void handleExport(format)}
+                              className={`w-full text-left px-4 py-2 rounded-lg text-sm transition-all
+                                ${darkMode ? 'hover:bg-white/10 text-gray-400' : 'hover:bg-gray-100 text-gray-600'}
+                              `}
+                            >
+                              {t(uiLanguage, label)}
+                            </button>
+                          ))}
 
                           {/* Divider */}
                           <div className={`my-2 border-t ${darkMode ? 'border-gray-700' : 'border-gray-200'}`} />
@@ -406,7 +423,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                               ${darkMode ? 'hover:bg-green-600/20 text-green-400' : 'hover:bg-green-50 text-green-600'}
                             `}
                           >
-                            📥 Import Archive
+                            📥 {t(uiLanguage, 'importArchive')}
                           </button>
                         </div>
                       )}
