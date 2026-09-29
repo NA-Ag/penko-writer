@@ -210,7 +210,7 @@ export const TEMPLATES: Template[] = [
           </div>
         </div>
         
-        <p style="text-align: right; font-size: 10pt; color: #6b7280; margin-bottom: 25px;">October 24, 2026</p>
+        <p style="text-align: right; font-size: 10pt; color: #6b7280; margin-bottom: 25px;">October 24, 2025</p>
         
         <p style="margin-bottom: 30px; font-size: 10.5pt; line-height: 1.5;">
           <strong>Hiring Manager</strong><br>
@@ -963,7 +963,7 @@ export const TEMPLATES: Template[] = [
                    </div>
                    
                    <div style="margin-top: 50px; text-align: center;">
-                       <img src="https://via.placeholder.com/100x100?text=QR" alt="QR Code" style="width: 100px; height: 100px; opacity: 0.5;">
+                       <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHdpZHRoPScxMDAnIGhlaWdodD0nMTAwJyB2aWV3Qm94PScwIDAgMTAwIDEwMCc+PHJlY3Qgd2lkdGg9JzEwMCcgaGVpZ2h0PScxMDAnIGZpbGw9JyNjY2NjY2MnLz48dGV4dCB4PSc1MCcgeT0nNTAnIGZvbnQtZmFtaWx5PSdBcmlhbCxzYW5zLXNlcmlmJyBmb250LXNpemU9JzIwJyBmaWxsPScjOTY5Njk2JyB0ZXh0LWFuY2hvcj0nbWlkZGxlJyBkb21pbmFudC1iYXNlbGluZT0nY2VudHJhbCc+UVI8L3RleHQ+PC9zdmc+" alt="QR Code" style="width: 100px; height: 100px; opacity: 0.5;">
                    </div>
                </td>
 
@@ -997,7 +997,7 @@ export const TEMPLATES: Template[] = [
           <tr>
             <td style="vertical-align: top;">
               <h1 style="margin: 0; color: #2b579a; font-size: 36px; letter-spacing: 2px;">INVOICE</h1>
-              <p style="margin: 5px 0; color: #666; font-weight: bold;">#INV-2024-001</p>
+              <p style="margin: 5px 0; color: #666; font-weight: bold;">#INV-2025-001</p>
             </td>
             <td style="text-align: right; vertical-align: top;">
               <h3 style="margin: 0; font-size: 18px;">Your Company Name</h3>
@@ -1020,11 +1020,11 @@ export const TEMPLATES: Template[] = [
                <table style="float: right;">
                  <tr>
                     <td style="padding-right: 15px; color: #666;">Date:</td>
-                    <td><strong>Oct 24, 2024</strong></td>
+                    <td><strong>Oct 24, 2025</strong></td>
                  </tr>
                  <tr>
                     <td style="padding-right: 15px; color: #666;">Due:</td>
-                    <td><strong>Nov 24, 2024</strong></td>
+                    <td><strong>Nov 24, 2025</strong></td>
                  </tr>
                </table>
             </td>

@@ -1,803 +1,355 @@
-import { DocumentData } from '../types';
-import { PAGE_MARGINS, PAGE_SIZES } from '../constants';
-import jsPDF from 'jspdf';
-import 'jspdf-autotable';
-import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType } from 'docx';
+/**
+ * Document export entry points (used by the Sidebar export menu).
+ *
+ * Every exporter works from the document DATA (`doc.content` etc.), never from
+ * the editor DOM, so they also work in markdown mode, for documents that are
+ * not open, and in tests. They throw on failure; the caller shows a toast.
+ * The `export*` entry points first load KaTeX / Prism (lazy editor assets) so
+ * equations are rendered; the DOCX and PDF writers are loaded on demand.
+ */
+import type { DocumentData } from '../types';
 import JSZip from 'jszip';
+import editorCss from '../editor/editor.css?raw';
+import { escapeHtml } from '../editor/sanitize';
+import { ensureRenderAssets } from '../editor/lazyAssets';
+import { fillPlaceholders, zoneHtml } from '../editor/pageChrome';
 import { htmlToMarkdown } from './markdownConverter';
+import { generateStyleCss } from './paragraphStyles';
+import { blocksToText, buildExportModel, htmlToPlainText, normalizeDocumentHtml, pageGeometry } from './exportModel';
+import { latexToUnicode } from './latexLite';
+import { PAGE_MARGINS } from '../constants';
+import { noteLabel } from '../editor/extensions/references';
 
-export const exportToDoc = (doc: DocumentData) => {
-  const config = doc.pageConfig || { size: 'A4', orientation: 'portrait', margins: 'normal' };
-  
-  let width = PAGE_SIZES[config.size].width;
-  let height = PAGE_SIZES[config.size].height;
-  if(config.orientation === 'landscape') {
-      [width, height] = [height, width];
-  }
-  
-  const marginVal = PAGE_MARGINS[config.margins] || '2.54cm';
+export interface ExportLabels {
+  endnotes?: string;
+  /** "Page {PAGE} of {PAGES}" in the UI language. */
+  pageOf?: string;
+}
 
-  const preHtml = `
-    <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
-    <head>
-        <meta charset='utf-8'>
-        <title>${doc.title}</title>
-        <style>
-            @page {
-                size: ${width} ${height};
-                margin: ${marginVal};
-            }
-            body { 
-                font-family: 'Times New Roman', serif; 
-                font-size: 11pt; 
-                line-height: 1.15;
-            }
-            table { border-collapse: collapse; width: 100%; }
-            td, th { border: 1px solid black; padding: 5px; }
-            /* Hide print UI elements if any exist in content */
-            .no-print { display: none; }
-        </style>
-    </head>
-    <body>
-  `;
-  const postHtml = "</body></html>";
-  
-  const html = preHtml + doc.content + postHtml;
+/* ------------------------------------------------------------------ */
+/* helpers                                                             */
+/* ------------------------------------------------------------------ */
 
-  const blob = new Blob(['\ufeff', html], {
-      type: 'application/msword'
-  });
-  
-  const url = 'data:application/vnd.ms-word;charset=utf-8,' + encodeURIComponent(html);
-  
-  const downloadLink = document.createElement("a");
-  document.body.appendChild(downloadLink);
-  
-  if(navigator.userAgent.indexOf("Chrome") !== -1) {
-      downloadLink.href = URL.createObjectURL(blob);
-  } else {
-      downloadLink.href = url;
-  }
-  
-  downloadLink.download = `${doc.title || 'Document'}.doc`;
-  downloadLink.click();
+export const safeFileName = (title: string | undefined, fallback = 'Document') =>
+  (title || '').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, 120) || fallback;
 
-  document.body.removeChild(downloadLink);
+/** Triggers a download; the object URL is revoked after the browser has picked it up. */
+export const downloadBlob = (blob: Blob, filename: string) => {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.rel = 'noopener';
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 };
 
-export const exportToDocx = async (doc: DocumentData) => {
-  try {
-    // Parse HTML content to extract text and basic formatting
-    const parser = new DOMParser();
-    const htmlDoc = parser.parseFromString(doc.content, 'text/html');
-    const paragraphs: Paragraph[] = [];
+const pageCss = (doc: DocumentData) => {
+  const geo = pageGeometry(doc.pageConfig);
+  const margin = PAGE_MARGINS[doc.pageConfig?.margins || 'normal'] || '2.54cm';
+  return { geo, margin, size: `${doc.pageConfig?.size === 'Letter' ? 'letter' : 'A4'} ${geo.landscape ? 'landscape' : 'portrait'}` };
+};
 
-    // Convert HTML elements to DOCX paragraphs
-    const processNode = (node: Node) => {
-      if (node.nodeName === 'H1') {
-        paragraphs.push(new Paragraph({
-          text: node.textContent || '',
-          heading: HeadingLevel.HEADING_1,
-        }));
-      } else if (node.nodeName === 'H2') {
-        paragraphs.push(new Paragraph({
-          text: node.textContent || '',
-          heading: HeadingLevel.HEADING_2,
-        }));
-      } else if (node.nodeName === 'H3') {
-        paragraphs.push(new Paragraph({
-          text: node.textContent || '',
-          heading: HeadingLevel.HEADING_3,
-        }));
-      } else if (node.nodeName === 'H4') {
-        paragraphs.push(new Paragraph({
-          text: node.textContent || '',
-          heading: HeadingLevel.HEADING_4,
-        }));
-      } else if (node.nodeName === 'P') {
-        const element = node as HTMLElement;
-        const children: TextRun[] = [];
+const BASE_CONTENT_CSS = `
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: #f1f5f9; color: #111827; }
+.penko-page { background: #fff; margin: 24px auto; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+.penko-doc { font-family: "Calibri", "Arial", sans-serif; font-size: 11pt; line-height: 1.15; color: #111827; }
+.penko-doc p { margin: 0; }
+.penko-doc img { cursor: default; }
+.penko-doc pre { background: #1f2937; color: #f9fafb; padding: 12px 14px; border-radius: 6px; overflow-x: auto; font-family: 'Source Code Pro', 'Courier New', monospace; font-size: 0.9em; line-height: 1.45; white-space: pre-wrap; }
+.penko-doc pre[data-theme="light"] { background: #f3f4f6; color: #111827; }
+.penko-doc div[data-type='page-break'] { border: none; margin: 0; height: 0; break-after: page; }
+.penko-doc div[data-type='page-break']::after { content: none; }
+.penko-hf { font-family: "Calibri", "Arial", sans-serif; font-size: 10pt; color: #4b5563; }
+.penko-hf p { margin: 0; }
+/* "text + centred page number" on one line */
+.penko-hf p:has(+ .penko-page-number) { display: inline; }
+.penko-header { margin-bottom: 18px; }
+.penko-footer { margin-top: 18px; }
+/* Each paragraph takes its direction from its own text (Arabic, Hebrew…). */
+.penko-doc :is(p, h1, h2, h3, h4, h5, h6, li, td, th, blockquote) { unicode-bidi: plaintext; }
+.penko-notes { font-size: 9pt; margin-top: 24px; border-top: 1px solid #d1d5db; padding-top: 8px; }
+.penko-notes ol { list-style: none; padding: 0; margin: 0; }
+.penko-notes h4 { font-size: 10pt; margin: 12px 0 4px; }
+/* Equations: KaTeX also emits MathML, which browsers render natively, so the
+   file needs no external CSS or math fonts (works offline). */
+.katex-html { display: none; }
+.katex-display, .katex-equation[data-display="true"] { display: block; text-align: center; margin: 0.5em 0; }
+math { font-size: 1.1em; }
+@media print {
+  body { background: #fff; }
+  .penko-page { margin: 0; box-shadow: none; padding: 0 !important; width: auto !important; min-height: 0 !important; }
+}
+`;
 
-        // Process inline formatting
-        element.childNodes.forEach(child => {
-          if (child.nodeType === Node.TEXT_NODE) {
-            children.push(new TextRun({ text: child.textContent || '' }));
-          } else if (child.nodeName === 'STRONG' || child.nodeName === 'B') {
-            children.push(new TextRun({ text: child.textContent || '', bold: true }));
-          } else if (child.nodeName === 'EM' || child.nodeName === 'I') {
-            children.push(new TextRun({ text: child.textContent || '', italics: true }));
-          } else if (child.nodeName === 'U') {
-            children.push(new TextRun({ text: child.textContent || '', underline: {} }));
-          } else {
-            children.push(new TextRun({ text: child.textContent || '' }));
-          }
-        });
+/** Parses HTML into an inert document (no image loads, no handlers). */
+const parseInert = (html: string) => new DOMParser().parseFromString(`<!DOCTYPE html><body>${html}</body>`, 'text/html').body;
 
-        // Handle text alignment
-        let alignment = AlignmentType.LEFT;
-        const textAlign = element.style.textAlign;
-        if (textAlign === 'center') alignment = AlignmentType.CENTER;
-        else if (textAlign === 'right') alignment = AlignmentType.RIGHT;
-        else if (textAlign === 'justify') alignment = AlignmentType.JUSTIFIED;
+/**
+ * Header / footer band, laid out like page 1 of the paginated view (same
+ * placeholders, number format and "text + centred number" rule). A web page
+ * has no "first page", so "different first page" doesn't hide it here.
+ */
+const headerFooterHtml = (doc: DocumentData, where: 'header' | 'footer', labels: ExportLabels) => {
+  const zone = zoneHtml({ ...doc, differentFirstPage: false }, where, 1, 1, { pageOfLabel: labels.pageOf });
+  return zone ? `<div class="penko-hf penko-${where}">${zone}</div>` : '';
+};
 
-        paragraphs.push(new Paragraph({
-          children: children.length > 0 ? children : [new TextRun({ text: element.textContent || '' })],
-          alignment,
-        }));
-      } else if (node.nodeName === 'BR') {
-        paragraphs.push(new Paragraph({ text: '' }));
-      }
-    };
-
-    // Process all body elements
-    htmlDoc.body.childNodes.forEach(processNode);
-
-    // If no paragraphs were created, add at least one empty paragraph
-    if (paragraphs.length === 0) {
-      paragraphs.push(new Paragraph({ text: '' }));
-    }
-
-    // Create DOCX document
-    const docxDocument = new Document({
-      sections: [{
-        properties: {
-          page: {
-            margin: {
-              top: 1440,  // 1 inch in twips (1440 twips = 1 inch)
-              right: 1440,
-              bottom: 1440,
-              left: 1440,
-            },
-          },
-        },
-        children: paragraphs,
-      }],
-    });
-
-    // Generate and download the DOCX file
-    const blob = await Packer.toBlob(docxDocument);
-    const url = URL.createObjectURL(blob);
-    const downloadLink = document.createElement('a');
-    downloadLink.href = url;
-    downloadLink.download = `${doc.title || 'Document'}.docx`;
-    document.body.appendChild(downloadLink);
-    downloadLink.click();
-    document.body.removeChild(downloadLink);
-    URL.revokeObjectURL(url);
-  } catch (error) {
-    console.error('DOCX export error:', error);
-    alert('Failed to export DOCX. Please try again.');
-  }
+const notesHtml = (content: Element, labels: ExportLabels) => {
+  const notes = Array.from(content.querySelectorAll('sup[data-type="footnote"]')).map(el => ({
+    type: el.getAttribute('data-note-type') === 'endnote' ? 'endnote' : 'footnote',
+    number: parseInt(el.getAttribute('data-number') || '1', 10) || 1,
+    content: el.getAttribute('data-content') || '',
+  }));
+  if (!notes.length) return '';
+  const list = (type: string) =>
+    notes
+      .filter(n => n.type === type)
+      .map(n => `<li><sup>${noteLabel(type, n.number)}</sup> ${escapeHtml(n.content)}</li>`)
+      .join('');
+  const fn = list('footnote');
+  const en = list('endnote');
+  return `<div class="penko-notes">${fn ? `<ol>${fn}</ol>` : ''}${en ? `<h4>${escapeHtml(labels.endnotes || 'Endnotes')}</h4><ol>${en}</ol>` : ''}</div>`;
 };
 
 /**
- * Export screenplay to PDF with industry-standard formatting
- * - Courier 12pt font
- * - Letter size, portrait
- * - Margins: Left 1.5", Right 1.0", Top 1.0", Bottom 1.0"
+ * A standalone, sanitized HTML file with the editor's content CSS inlined.
+ * Also used for the browser print-to-PDF fallback.
  */
-export const exportScreenplayToPdf = async (doc: DocumentData) => {
-  try {
-    const pdf = new jsPDF({
-      orientation: 'portrait',
-      unit: 'in',
-      format: 'letter',
-      compress: true
-    });
-
-    // Industry-standard screenplay margins
-    const margins = {
-      left: 1.5,   // 1.5 inches
-      right: 1.0,  // 1.0 inch
-      top: 1.0,    // 1.0 inch
-      bottom: 1.0  // 1.0 inch
-    };
-
-    const pageWidth = 8.5;  // Letter width in inches
-    const pageHeight = 11;  // Letter height in inches
-    const contentWidth = pageWidth - margins.left - margins.right;
-
-    // Set Courier font (standard for screenplays)
-    pdf.setFont('courier');
-    pdf.setFontSize(12);
-
-    // Parse HTML content
-    const parser = new DOMParser();
-    const htmlDoc = parser.parseFromString(doc.content, 'text/html');
-
-    let yPosition = margins.top;
-    const lineHeight = 12 / 72; // 12pt to inches (72 points per inch)
-
-    // Check if we need a new page
-    const checkPageBreak = () => {
-      if (yPosition + lineHeight > pageHeight - margins.bottom) {
-        pdf.addPage();
-        yPosition = margins.top;
-        return true;
-      }
-      return false;
-    };
-
-    // Process each paragraph in the screenplay
-    const processParagraph = (element: HTMLElement) => {
-      const screenplayType = element.getAttribute('data-screenplay-type');
-      const text = element.textContent?.trim() || '';
-
-      if (!text && !screenplayType) return;
-
-      checkPageBreak();
-
-      // Calculate indentation based on screenplay element type
-      let leftIndent = 0;
-      let maxWidth = contentWidth;
-      let alignment: 'left' | 'center' | 'right' = 'left';
-      let addSpaceBefore = 0;
-      let addSpaceAfter = 0;
-
-      switch (screenplayType) {
-        case 'scene-heading':
-          // Scene headings: left-aligned, all caps, extra space before
-          leftIndent = 0;
-          maxWidth = contentWidth;
-          addSpaceBefore = lineHeight * 2;
-          addSpaceAfter = lineHeight;
-          pdf.setFont('courier', 'bold');
-          break;
-
-        case 'action':
-          // Action: left-aligned, normal spacing
-          leftIndent = 0;
-          maxWidth = contentWidth;
-          addSpaceAfter = lineHeight;
-          pdf.setFont('courier', 'normal');
-          break;
-
-        case 'character':
-          // Character: indented 3.7" from left edge
-          leftIndent = 3.7 - margins.left;
-          maxWidth = contentWidth - leftIndent;
-          addSpaceBefore = lineHeight;
-          pdf.setFont('courier', 'normal');
-          break;
-
-        case 'parenthetical':
-          // Parenthetical: indented 3.1" from left edge
-          leftIndent = 3.1 - margins.left;
-          maxWidth = contentWidth - leftIndent;
-          pdf.setFont('courier', 'normal');
-          break;
-
-        case 'dialogue':
-          // Dialogue: indented 2.5" from left, max width 3.5"
-          leftIndent = 2.5 - margins.left;
-          maxWidth = 3.5;
-          addSpaceAfter = lineHeight;
-          pdf.setFont('courier', 'normal');
-          break;
-
-        case 'transition':
-          // Transition: right-aligned, all caps
-          leftIndent = 0;
-          maxWidth = contentWidth;
-          alignment = 'right';
-          addSpaceBefore = lineHeight;
-          addSpaceAfter = lineHeight;
-          pdf.setFont('courier', 'normal');
-          break;
-
-        default:
-          // Default to action formatting
-          leftIndent = 0;
-          maxWidth = contentWidth;
-          pdf.setFont('courier', 'normal');
-      }
-
-      // Add space before if needed
-      if (addSpaceBefore > 0) {
-        yPosition += addSpaceBefore;
-        checkPageBreak();
-      }
-
-      // Split text into lines that fit the width
-      const lines = pdf.splitTextToSize(text, maxWidth);
-
-      // Render each line
-      lines.forEach((line: string, index: number) => {
-        if (index > 0) checkPageBreak();
-
-        let xPos = margins.left + leftIndent;
-
-        if (alignment === 'right') {
-          xPos = pageWidth - margins.right;
-          pdf.text(line, xPos, yPosition, { align: 'right' });
-        } else if (alignment === 'center') {
-          xPos = margins.left + (contentWidth / 2);
-          pdf.text(line, xPos, yPosition, { align: 'center' });
-        } else {
-          pdf.text(line, xPos, yPosition);
-        }
-
-        yPosition += lineHeight;
-      });
-
-      // Add space after if needed
-      if (addSpaceAfter > 0) {
-        yPosition += addSpaceAfter;
-      }
-
-      // Reset font to normal
-      pdf.setFont('courier', 'normal');
-    };
-
-    // Process all paragraphs
-    const paragraphs = htmlDoc.querySelectorAll('p');
-    paragraphs.forEach(p => {
-      processParagraph(p as HTMLElement);
-    });
-
-    // Add page numbers (optional, centered at bottom)
-    const pageCount = (pdf as any).internal.getNumberOfPages();
-    for (let i = 1; i <= pageCount; i++) {
-      pdf.setPage(i);
-      pdf.setFontSize(12);
-      pdf.setFont('courier', 'normal');
-      pdf.text(`${i}.`, pageWidth / 2, pageHeight - 0.5, { align: 'center' });
-    }
-
-    pdf.save(`${doc.title || 'Screenplay'}.pdf`);
-  } catch (error) {
-    console.error('Screenplay PDF export error:', error);
-    alert('Failed to export screenplay PDF. Please try again.');
-  }
-};
-
-export const exportToPdf = async (doc: DocumentData) => {
-  // Use screenplay-specific export if this is a screenplay
-  if (doc.isScreenplay) {
-    return exportScreenplayToPdf(doc);
-  }
-
-  try {
-    const config = doc.pageConfig || { size: 'A4', orientation: 'portrait', margins: 'normal' };
-    const orientation = config.orientation === 'landscape' ? 'landscape' : 'portrait';
-
-    const pdf = new jsPDF({
-      orientation,
-      unit: 'mm',
-      format: config.size === 'A4' ? 'a4' : 'letter',
-      compress: true
-    });
-
-    // Get page dimensions
-    const pageWidth = pdf.internal.pageSize.getWidth();
-    const pageHeight = pdf.internal.pageSize.getHeight();
-
-    // Calculate margins
-    const marginMap = {
-      normal: 25.4,    // 1 inch
-      narrow: 12.7,    // 0.5 inch
-      wide: 50.8,      // 2 inches
-      none: 0
-    };
-    const margin = marginMap[config.margins || 'normal'];
-    const contentWidth = pageWidth - (2 * margin);
-
-    // Parse HTML content
-    const parser = new DOMParser();
-    const htmlDoc = parser.parseFromString(doc.content, 'text/html');
-
-    let yPosition = margin;
-    const lineHeight = 7; // mm
-
-    // Process each node in the document
-    const processNode = (node: Node, indent: number = 0) => {
-      if (node.nodeType === Node.TEXT_NODE) {
-        const text = node.textContent?.trim();
-        if (!text) return;
-
-        const lines = pdf.splitTextToSize(text, contentWidth - indent);
-        lines.forEach((line: string) => {
-          if (yPosition + lineHeight > pageHeight - margin) {
-            pdf.addPage();
-            yPosition = margin;
-          }
-          pdf.text(line, margin + indent, yPosition);
-          yPosition += lineHeight;
-        });
-        return;
-      }
-
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-
-      const element = node as HTMLElement;
-      const tagName = element.tagName.toLowerCase();
-
-      // Handle headings
-      if (tagName.match(/^h[1-6]$/)) {
-        const level = parseInt(tagName[1]);
-        const fontSize = Math.max(24 - (level * 3), 12);
-
-        if (yPosition + lineHeight * 2 > pageHeight - margin) {
-          pdf.addPage();
-          yPosition = margin;
-        }
-
-        pdf.setFontSize(fontSize);
-        pdf.setFont('helvetica', 'bold');
-
-        const text = element.textContent || '';
-        const lines = pdf.splitTextToSize(text, contentWidth);
-        lines.forEach((line: string) => {
-          pdf.text(line, margin, yPosition);
-          yPosition += lineHeight * 1.5;
-        });
-
-        pdf.setFontSize(12);
-        pdf.setFont('helvetica', 'normal');
-        yPosition += lineHeight * 0.5;
-        return;
-      }
-
-      // Handle paragraphs
-      if (tagName === 'p') {
-        if (yPosition > margin + lineHeight) {
-          yPosition += lineHeight * 0.3; // Small gap before paragraph
-        }
-
-        let textIndent = 0;
-        const align = element.style.textAlign;
-
-        // Process inline formatting
-        element.childNodes.forEach(child => {
-          if (child.nodeType === Node.TEXT_NODE) {
-            const text = child.textContent?.trim();
-            if (!text) return;
-
-            const lines = pdf.splitTextToSize(text, contentWidth - textIndent);
-            lines.forEach((line: string) => {
-              if (yPosition + lineHeight > pageHeight - margin) {
-                pdf.addPage();
-                yPosition = margin;
-              }
-
-              let xPos = margin + textIndent;
-              if (align === 'center') {
-                xPos = pageWidth / 2;
-                pdf.text(line, xPos, yPosition, { align: 'center' });
-              } else if (align === 'right') {
-                xPos = pageWidth - margin;
-                pdf.text(line, xPos, yPosition, { align: 'right' });
-              } else if (align === 'justify') {
-                pdf.text(line, xPos, yPosition, { align: 'justify', maxWidth: contentWidth });
-              } else {
-                pdf.text(line, xPos, yPosition);
-              }
-
-              yPosition += lineHeight;
-            });
-          } else if (child.nodeType === Node.ELEMENT_NODE) {
-            const childEl = child as HTMLElement;
-            const childTag = childEl.tagName.toLowerCase();
-            const text = childEl.textContent?.trim() || '';
-
-            // Handle bold, italic, underline
-            if (childTag === 'strong' || childTag === 'b') {
-              pdf.setFont('helvetica', 'bold');
-            } else if (childTag === 'em' || childTag === 'i') {
-              pdf.setFont('helvetica', 'italic');
-            }
-
-            const lines = pdf.splitTextToSize(text, contentWidth - textIndent);
-            lines.forEach((line: string) => {
-              if (yPosition + lineHeight > pageHeight - margin) {
-                pdf.addPage();
-                yPosition = margin;
-              }
-              pdf.text(line, margin + textIndent, yPosition);
-              yPosition += lineHeight;
-            });
-
-            pdf.setFont('helvetica', 'normal');
-          }
-        });
-
-        yPosition += lineHeight * 0.3; // Small gap after paragraph
-        return;
-      }
-
-      // Handle lists
-      if (tagName === 'ul' || tagName === 'ol') {
-        yPosition += lineHeight * 0.5;
-        let counter = 1;
-
-        element.querySelectorAll('li').forEach(li => {
-          if (yPosition + lineHeight > pageHeight - margin) {
-            pdf.addPage();
-            yPosition = margin;
-          }
-
-          const bullet = tagName === 'ul' ? '•' : `${counter}.`;
-          const text = li.textContent?.trim() || '';
-
-          pdf.text(bullet, margin + 5, yPosition);
-
-          const lines = pdf.splitTextToSize(text, contentWidth - 15);
-          lines.forEach((line: string, idx: number) => {
-            if (idx > 0 && yPosition + lineHeight > pageHeight - margin) {
-              pdf.addPage();
-              yPosition = margin;
-            }
-            pdf.text(line, margin + 15, yPosition);
-            yPosition += lineHeight;
-          });
-
-          counter++;
-        });
-
-        yPosition += lineHeight * 0.5;
-        return;
-      }
-
-      // Handle tables
-      if (tagName === 'table') {
-        const rows: any[][] = [];
-        element.querySelectorAll('tr').forEach(tr => {
-          const row: string[] = [];
-          tr.querySelectorAll('td, th').forEach(cell => {
-            row.push(cell.textContent?.trim() || '');
-          });
-          if (row.length > 0) rows.push(row);
-        });
-
-        if (rows.length > 0) {
-          (pdf as any).autoTable({
-            startY: yPosition,
-            head: rows.length > 0 ? [rows[0]] : [],
-            body: rows.slice(1),
-            margin: { left: margin, right: margin },
-            theme: 'grid',
-            styles: { fontSize: 10, cellPadding: 2 },
-            headStyles: { fillColor: [66, 139, 202], fontStyle: 'bold' }
-          });
-
-          yPosition = (pdf as any).lastAutoTable.finalY + lineHeight;
-        }
-        return;
-      }
-
-      // Handle horizontal rule
-      if (tagName === 'hr') {
-        if (yPosition + lineHeight > pageHeight - margin) {
-          pdf.addPage();
-          yPosition = margin;
-        }
-        pdf.setLineWidth(0.5);
-        pdf.line(margin, yPosition, pageWidth - margin, yPosition);
-        yPosition += lineHeight;
-        return;
-      }
-
-      // Recursively process children for other elements
-      element.childNodes.forEach(child => processNode(child, indent));
-    };
-
-    // Start processing
-    htmlDoc.body.childNodes.forEach(node => processNode(node));
-
-    // Add header and footer if present
-    if (doc.header || doc.footer || doc.showPageNumbers) {
-      const pageCount = (pdf as any).internal.getNumberOfPages();
-
-      for (let i = 1; i <= pageCount; i++) {
-        pdf.setPage(i);
-        pdf.setFontSize(10);
-        pdf.setTextColor(128, 128, 128);
-
-        // Header
-        if (doc.header) {
-          pdf.text(doc.header, pageWidth / 2, 15, { align: 'center' });
-        }
-
-        // Footer / Page numbers
-        if (doc.footer || doc.showPageNumbers) {
-          const footerY = pageHeight - 10;
-
-          if (doc.footer) {
-            pdf.text(doc.footer, pageWidth / 2, footerY, { align: 'center' });
-          }
-
-          if (doc.showPageNumbers) {
-            const pageNumText = `Page ${i} of ${pageCount}`;
-            const position = doc.pageNumberPosition || 'footer-center';
-
-            if (position.includes('footer')) {
-              const footerPageY = doc.footer ? footerY + 5 : footerY;
-              if (position.includes('left')) {
-                pdf.text(pageNumText, margin, footerPageY);
-              } else if (position.includes('right')) {
-                pdf.text(pageNumText, pageWidth - margin, footerPageY, { align: 'right' });
-              } else {
-                pdf.text(pageNumText, pageWidth / 2, footerPageY, { align: 'center' });
-              }
-            }
-          }
-        }
-
-        pdf.setTextColor(0, 0, 0);
-      }
-    }
-
-    pdf.save(`${doc.title || 'Document'}.pdf`);
-  } catch (error) {
-    console.error('PDF export error:', error);
-    alert('Failed to export PDF. Please try again.');
-  }
-};
-
-export const exportToTxt = (doc: DocumentData) => {
-  const editorElement = document.getElementById('editor-content');
-  if (!editorElement) {
-    alert('Editor content not found');
-    return;
-  }
-
-  const text = editorElement.innerText || '';
-  const blob = new Blob([text], { type: 'text/plain' });
-  const url = URL.createObjectURL(blob);
-  const downloadLink = document.createElement('a');
-  downloadLink.href = url;
-  downloadLink.download = `${doc.title || 'Document'}.txt`;
-  document.body.appendChild(downloadLink);
-  downloadLink.click();
-  document.body.removeChild(downloadLink);
-  URL.revokeObjectURL(url);
-};
-
-export const exportToHtml = (doc: DocumentData) => {
-  const config = doc.pageConfig || { size: 'A4', orientation: 'portrait', margins: 'normal' };
-
-  let width = PAGE_SIZES[config.size].width;
-  let height = PAGE_SIZES[config.size].height;
-  if(config.orientation === 'landscape') {
-      [width, height] = [height, width];
-  }
-
-  const marginVal = PAGE_MARGINS[config.margins] || '2.54cm';
-
-  const htmlContent = `<!DOCTYPE html>
-<html lang="en">
+export const buildStandaloneHtml = (doc: DocumentData, labels: ExportLabels = {}): string => {
+  const content = normalizeDocumentHtml(doc);
+  const { geo, margin, size } = pageCss(doc);
+  const cls = `penko-doc${doc.isScreenplay ? ' screenplay-mode' : ''}`;
+  return `<!DOCTYPE html>
+<html lang="${escapeHtml(doc.language || 'en')}">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${doc.title || 'Document'}</title>
-    <style>
-        @page {
-            size: ${width} ${height};
-            margin: ${marginVal};
-        }
-        body {
-            font-family: 'Calibri', 'Arial', sans-serif;
-            font-size: 11pt;
-            line-height: 1.15;
-            max-width: ${width};
-            margin: 0 auto;
-            padding: ${marginVal};
-        }
-        table { border-collapse: collapse; width: 100%; }
-        td, th { border: 1px solid black; padding: 5px; }
-        img { max-width: 100%; height: auto; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="generator" content="Penko Writer">
+${doc.styles?.length ? `<meta name="penko-styles" content="${escapeHtml(JSON.stringify(doc.styles))}">\n` : ''}<title>${escapeHtml(doc.title || 'Document')}</title>
+<style>
+@page { size: ${size}; margin: ${margin}; }
+${editorCss}
+${BASE_CONTENT_CSS}
+${doc.isScreenplay ? '' : generateStyleCss(doc.styles)}
+.penko-page { width: ${geo.widthPt}pt; max-width: 100%; min-height: ${geo.heightPt}pt; padding: ${margin}; }
+</style>
 </head>
 <body>
-    ${doc.content}
+<div class="penko-page">
+${headerFooterHtml(doc, 'header', labels)}
+<div class="${cls}"><div class="ProseMirror">${content}</div></div>
+${notesHtml(parseInert(content), labels)}
+${headerFooterHtml(doc, 'footer', labels)}
+</div>
 </body>
 </html>`;
-
-  const blob = new Blob([htmlContent], { type: 'text/html' });
-  const url = URL.createObjectURL(blob);
-  const downloadLink = document.createElement('a');
-  downloadLink.href = url;
-  downloadLink.download = `${doc.title || 'Document'}.html`;
-  document.body.appendChild(downloadLink);
-  downloadLink.click();
-  document.body.removeChild(downloadLink);
-  URL.revokeObjectURL(url);
 };
 
+/* ------------------------------------------------------------------ */
+/* .doc (Word 97-2003 compatible single-file web page / MHTML)         */
+/* ------------------------------------------------------------------ */
+
 /**
- * Export all documents as a ZIP archive
+ * Builds a Word-compatible `.doc`: a Word HTML document (Office namespaces,
+ * print view, @page setup) that Word, LibreOffice and Pages open as a normal
+ * document. Images stay embedded as data URIs (LibreOffice shows them; some
+ * Word versions don't), header/footer are not included — DOCX is the
+ * full-fidelity format.
  */
-export const exportAllDocuments = async (documents: DocumentData[]) => {
-  if (documents.length === 0) {
-    alert('No documents to export');
-    return;
-  }
+export const buildWordHtmlDoc = (doc: DocumentData): string => {
+  const content = normalizeDocumentHtml(doc);
+  const { geo, margin } = pageCss(doc);
+  const container = parseInert(content);
+  // equations: KaTeX markup doesn't survive Word, use the readable Unicode form (E = mc²)
+  container.querySelectorAll('span[data-type="equation"]').forEach(el => {
+    const i = container.ownerDocument.createElement('i');
+    i.textContent = latexToUnicode(el.getAttribute('data-latex') || '');
+    el.replaceWith(i);
+  });
+  container.querySelectorAll('[data-type="page-break"]').forEach(el => {
+    const br = container.ownerDocument.createElement('br');
+    br.setAttribute('clear', 'all');
+    br.setAttribute('style', 'page-break-before:always');
+    el.replaceWith(br);
+  });
+  const notes = notesHtml(container, {});
+  const widthIn = (geo.landscape ? geo.heightPt : geo.widthPt) / 72;
+  const heightIn = (geo.landscape ? geo.widthPt : geo.heightPt) / 72;
+  const html = `<html xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns:m="http://schemas.microsoft.com/office/2004/12/omml" xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta name="ProgId" content="Word.Document">
+<meta name="Generator" content="Penko Writer">
+<title>${escapeHtml(doc.title || 'Document')}</title>
+<!--[if gte mso 9]><xml><w:WordDocument><w:View>Print</w:View><w:Zoom>100</w:Zoom><w:DoNotOptimizeForBrowser/></w:WordDocument></xml><![endif]-->
+<style>
+@page WordSection1 { size: ${geo.landscape ? heightIn : widthIn}in ${geo.landscape ? widthIn : heightIn}in; margin: ${margin}; mso-page-orientation: ${geo.landscape ? 'landscape' : 'portrait'}; }
+div.WordSection1 { page: WordSection1; }
+body { font-family: Calibri, Arial, sans-serif; font-size: 11pt; line-height: 115%; }
+p { margin: 0; }
+h1 { font-size: 22pt; } h2 { font-size: 16.5pt; } h3 { font-size: 13.75pt; } h4 { font-size: 12pt; }
+table { border-collapse: collapse; width: 100%; }
+td, th { border: 1px solid #cccccc; padding: 4px; vertical-align: top; }
+th { background: #f7f7f7; }
+blockquote { border-left: 3pt solid #d1d5db; margin-left: 0; padding-left: 10pt; color: #4b5563; font-style: italic; }
+pre { font-family: "Courier New", monospace; font-size: 10pt; background: #f3f4f6; padding: 6pt; }
+.penko-notes { font-size: 9pt; border-top: 1px solid #cccccc; margin-top: 18pt; }
+</style>
+</head>
+<body lang="${escapeHtml(doc.language || 'en-US')}">
+<div class="WordSection1">
+${container.innerHTML}
+${notes}
+</div>
+</body>
+</html>`;
+  return html;
+};
 
-  try {
-    const zip = new JSZip();
-    const folder = zip.folder('penko-writer-documents');
+/* ------------------------------------------------------------------ */
+/* Exporters                                                           */
+/* ------------------------------------------------------------------ */
 
-    if (!folder) {
-      throw new Error('Failed to create ZIP folder');
+export const exportToDoc = async (doc: DocumentData) => {
+  await ensureRenderAssets();
+  const html = buildWordHtmlDoc(doc);
+  downloadBlob(new Blob(['\ufeff', html], { type: 'application/msword' }), `${safeFileName(doc.title)}.doc`);
+};
+
+export const exportToDocx = async (doc: DocumentData, labels: ExportLabels = {}) => {
+  const [{ buildDocxBlob }] = await Promise.all([import('./docxExport'), ensureRenderAssets()]);
+  const blob = await buildDocxBlob(doc, labels);
+  downloadBlob(blob, `${safeFileName(doc.title)}.docx`);
+};
+
+/** Opens the browser print dialog for a print-styled rendering of the document. */
+export const printDocumentHtml = async (doc: DocumentData, labels: ExportLabels = {}): Promise<void> => {
+  await ensureRenderAssets();
+  return new Promise((resolve, reject) => {
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('aria-hidden', 'true');
+    iframe.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden;';
+    document.body.appendChild(iframe);
+    const win = iframe.contentWindow;
+    const idoc = iframe.contentDocument;
+    if (!win || !idoc) {
+      iframe.remove();
+      reject(new Error('print unavailable'));
+      return;
     }
-
-    // Add each document as JSON file
-    documents.forEach((doc, index) => {
-      const sanitizedTitle = doc.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-      const filename = `${index + 1}_${sanitizedTitle}.json`;
-
-      const docData = {
-        id: doc.id,
-        title: doc.title,
-        content: doc.content,
-        createdAt: doc.createdAt,
-        lastModified: doc.lastModified,
-        pageConfig: doc.pageConfig,
-        language: doc.language,
-        header: doc.header,
-        footer: doc.footer,
-        showPageNumbers: doc.showPageNumbers,
-        pageNumberPosition: doc.pageNumberPosition,
-        comments: doc.comments,
-        trackChanges: doc.trackChanges,
-        trackingEnabled: doc.trackingEnabled,
-        currentUser: doc.currentUser,
-      };
-
-      folder.file(filename, JSON.stringify(docData, null, 2));
+    idoc.open();
+    idoc.write(buildStandaloneHtml(doc, labels));
+    idoc.close();
+    const images = Array.from(idoc.images);
+    const ready = Promise.all([
+      ...images.map(img => (img.complete ? Promise.resolve() : new Promise(r => { img.onload = img.onerror = () => r(null); }))),
+      (idoc as any).fonts?.ready ?? Promise.resolve(),
+    ]);
+    const timeout = new Promise(r => setTimeout(r, 3000));
+    Promise.race([ready, timeout]).then(() => {
+      try {
+        win.focus();
+        win.print();
+        resolve();
+      } catch (err) {
+        reject(err);
+      } finally {
+        setTimeout(() => iframe.remove(), 1000);
+      }
     });
-
-    // Add metadata file
-    const metadata = {
-      exportDate: new Date().toISOString(),
-      version: '1.0.0',
-      documentCount: documents.length,
-      appName: 'Penko Writer',
-    };
-    folder.file('metadata.json', JSON.stringify(metadata, null, 2));
-
-    // Generate ZIP file
-    const blob = await zip.generateAsync({ type: 'blob' });
-    const url = URL.createObjectURL(blob);
-    const downloadLink = document.createElement('a');
-    downloadLink.href = url;
-    downloadLink.download = `penko-writer-backup-${new Date().toISOString().split('T')[0]}.zip`;
-    document.body.appendChild(downloadLink);
-    downloadLink.click();
-    document.body.removeChild(downloadLink);
-    URL.revokeObjectURL(url);
-
-    console.log(`[Export] Successfully exported ${documents.length} documents`);
-  } catch (error) {
-    console.error('[Export] Failed to export all documents:', error);
-    alert('Failed to export documents. Please try again.');
-  }
+  });
 };
 
+export type PdfExportResult = { method: 'pdf'; droppedSymbols: string[] } | { method: 'print'; chars: string[] };
+
 /**
- * Export document to Markdown (.md) format
+ * PDF export. Produces a real text PDF with jsPDF; when the document uses a
+ * script the built-in PDF fonts can't render (CJK, Cyrillic, Arabic, emoji…)
+ * it opens the browser's print dialog instead (Save as PDF), which renders
+ * every script correctly with system fonts.
  */
-export const exportToMarkdown = (doc: DocumentData) => {
-  try {
-    // Convert HTML content to Markdown
-    const markdown = htmlToMarkdown(doc.content);
-
-    // Create a blob with the markdown content
-    const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-
-    // Create and trigger download
-    const downloadLink = document.createElement('a');
-    downloadLink.href = url;
-    downloadLink.download = `${doc.title || 'Document'}.md`;
-    document.body.appendChild(downloadLink);
-    downloadLink.click();
-    document.body.removeChild(downloadLink);
-    URL.revokeObjectURL(url);
-
-    console.log('[Export] Successfully exported to Markdown');
-  } catch (error) {
-    console.error('[Export] Failed to export to Markdown:', error);
-    alert('Failed to export to Markdown. Please try again.');
+export const exportToPdf = async (doc: DocumentData, labels: ExportLabels = {}): Promise<PdfExportResult> => {
+  const [{ buildPdf }] = await Promise.all([import('./pdfExport'), ensureRenderAssets()]);
+  const result = await buildPdf(doc, labels);
+  if (result.kind === 'unsupported-script') {
+    // Prefer printing the live paginated view (identical to the screen); fall back to a print-styled rendering
+    if (document.querySelector('.penko-page[data-paginated="true"]')) {
+      const { printCurrentDocument } = await import('./print');
+      await printCurrentDocument();
+    } else {
+      await printDocumentHtml(doc, labels);
+    }
+    return { method: 'print', chars: result.chars };
   }
+  downloadBlob(result.pdf.output('blob'), `${safeFileName(doc.title, doc.isScreenplay ? 'Screenplay' : 'Document')}.pdf`);
+  return { method: 'pdf', droppedSymbols: result.droppedSymbols };
+};
+
+export const buildPlainText = (doc: DocumentData, labels: ExportLabels = {}): string => {
+  const model = buildExportModel(doc);
+  let text = blocksToText(model.blocks).trim();
+  // one continuous "page": placeholders read as page 1 of 1
+  const header = fillPlaceholders(htmlToPlainText(model.header), 1, 1, model.pageNumberFormat);
+  const footer = fillPlaceholders(htmlToPlainText(model.footer), 1, 1, model.pageNumberFormat);
+  const fns = model.notes.filter(n => n.noteType === 'footnote');
+  const ens = model.notes.filter(n => n.noteType === 'endnote');
+  if (fns.length) text += `\n\n----------\n${fns.map(n => `[${n.label}] ${n.content}`).join('\n')}`;
+  if (ens.length) text += `\n\n${labels.endnotes || 'Endnotes'}\n${ens.map(n => `[${n.label}] ${n.content}`).join('\n')}`;
+  if (header) text = `${header}\n\n${text}`;
+  if (footer) text += `\n\n${footer}`;
+  return `${text}\n`;
+};
+
+export const exportToTxt = async (doc: DocumentData, labels: ExportLabels = {}) => {
+  await ensureRenderAssets();
+  downloadBlob(new Blob([buildPlainText(doc, labels)], { type: 'text/plain;charset=utf-8' }), `${safeFileName(doc.title)}.txt`);
+};
+
+export const exportToHtml = async (doc: DocumentData, labels: ExportLabels = {}) => {
+  await ensureRenderAssets();
+  downloadBlob(new Blob([buildStandaloneHtml(doc, labels)], { type: 'text/html;charset=utf-8' }), `${safeFileName(doc.title)}.html`);
+};
+
+/** Markdown: the exact source for markdown-mode documents, otherwise converted. */
+export const buildMarkdown = (doc: DocumentData): string =>
+  doc.isMarkdownMode && doc.markdownSource != null ? doc.markdownSource : htmlToMarkdown(normalizeDocumentHtml(doc));
+
+export const exportToMarkdown = async (doc: DocumentData) => {
+  await ensureRenderAssets();
+  downloadBlob(new Blob([buildMarkdown(doc)], { type: 'text/markdown;charset=utf-8' }), `${safeFileName(doc.title)}.md`);
+};
+
+export const ARCHIVE_FOLDER = 'penko-writer-documents';
+
+/** Builds the backup ZIP (one JSON file per document + metadata.json). */
+export const buildArchive = async (documents: DocumentData[]): Promise<Blob> => {
+  const zip = new JSZip();
+  const folder = zip.folder(ARCHIVE_FOLDER)!;
+  const used = new Set<string>();
+  documents.forEach((doc, index) => {
+    let name = `${index + 1}_${(doc.title || 'untitled').replace(/[^a-z0-9]+/gi, '_').toLowerCase().slice(0, 60)}.json`;
+    while (used.has(name)) name = name.replace(/\.json$/, '_.json');
+    used.add(name);
+    // everything the app persists (content, pageConfig, header/footer, comments,
+    // citations, isScreenplay, isMarkdownMode, markdownSource, ...)
+    folder.file(name, JSON.stringify(doc, null, 2));
+  });
+  folder.file(
+    'metadata.json',
+    JSON.stringify({ exportDate: new Date().toISOString(), version: '2.0.0', documentCount: documents.length, appName: 'Penko Writer' }, null, 2),
+  );
+  return zip.generateAsync({ type: 'blob' });
+};
+
+/** Export all documents as a ZIP archive. Returns false when there's nothing to export. */
+export const exportAllDocuments = async (documents: DocumentData[]): Promise<boolean> => {
+  if (!documents.length) return false;
+  const blob = await buildArchive(documents);
+  downloadBlob(blob, `penko-writer-backup-${new Date().toISOString().split('T')[0]}.zip`);
+  return true;
 };

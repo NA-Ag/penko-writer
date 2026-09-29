@@ -1,32 +1,79 @@
-import React, { useState, useRef } from 'react';
-import { Upload, X, FileText, AlertCircle, CheckCircle } from 'lucide-react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Upload, X, FileText, AlertCircle, CheckCircle, Copy } from 'lucide-react';
 import { importDocument, validateFileSize, getFileAcceptString, getSupportedExtensions, ImportResult } from '../utils/import';
 import { LanguageCode, t } from '../utils/translations';
-import { useFocusTrap } from '../utils/hooks';
+import { useFocusTrap, useEscapeKey } from '../utils/hooks';
+import { useApp } from '../AppContext';
+import type { DocumentData } from '../types';
+import { useFiles, type OpenSource } from '../state/FilesContext';
+import type { FsaFileHandle } from '../utils/files/fileAccess';
 
 interface ImportDialogProps {
   isOpen: boolean;
   onClose: () => void;
-  onImport: (title: string, content: string) => void;
+  /** Unused: the dialog follows the `dark` class on <html>. */
   darkMode?: boolean;
   uiLanguage?: LanguageCode;
 }
 
-const ImportDialog: React.FC<ImportDialogProps> = ({ isOpen, onClose, onImport, darkMode = false, uiLanguage = 'en-US' }) => {
+/**
+ * "Open File": the single entry point for opening documents — .penko files
+ * (linked to the file on Chromium) and every importable format. Drag & drop
+ * onto the window, recent files and the OS file handler also land here.
+ */
+const ImportDialog: React.FC<ImportDialogProps> = ({ isOpen, onClose, uiLanguage = 'en-US' }) => {
   const [isDragging, setIsDragging] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [result, setResult] = useState<ImportResult | null>(null);
+  /** A .penko file whose document is already in the app: replace, keep both or cancel. */
+  const [conflict, setConflict] = useState<{ result: ImportResult; source: OpenSource } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dialogRef = useFocusTrap<HTMLDivElement>(isOpen);
+  const { documents } = useApp();
+  const files = useFiles();
+  const { completeOpen, takePendingOpen, pendingOpen } = files;
+  const autoImportTimer = useRef<number | null>(null);
+  // bumps on close so an import that finishes after the dialog closed is ignored
+  const session = useRef(0);
 
-  if (!isOpen) return null;
+  const cancelAutoImport = useCallback(() => {
+    if (autoImportTimer.current !== null) {
+      window.clearTimeout(autoImportTimer.current);
+      autoImportTimer.current = null;
+    }
+  }, []);
 
-  const handleFileSelect = async (file: File) => {
+  useEffect(() => {
+    if (!isOpen) {
+      // closed from outside (e.g. after importing): start fresh next time
+      cancelAutoImport();
+      session.current++;
+      setResult(null);
+      setConflict(null);
+      setIsProcessing(false);
+      setIsDragging(false);
+    }
+  }, [isOpen, cancelAutoImport]);
+  useEffect(() => cancelAutoImport, [cancelAutoImport]);
+
+  // A file handed over by drag & drop / recent files / the OS
+  useEffect(() => {
+    if (!isOpen || !pendingOpen) return;
+    const p = takePendingOpen();
+    if (p) void handleFileSelect(p.file, p.handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, pendingOpen]);
+
+  const handleFileSelect = async (file: File, handle?: FsaFileHandle) => {
+    cancelAutoImport();
+    const mySession = session.current;
     setResult(null);
+    setConflict(null);
+    setIsDragging(false);
     setIsProcessing(true);
 
     // Validate file size
-    const sizeValidation = validateFileSize(file);
+    const sizeValidation = validateFileSize(file, uiLanguage);
     if (!sizeValidation.valid) {
       setResult({
         success: false,
@@ -38,18 +85,42 @@ const ImportDialog: React.FC<ImportDialogProps> = ({ isOpen, onClose, onImport, 
       return;
     }
 
-    // Import document
-    const importResult = await importDocument(file);
+    let importResult: ImportResult;
+    try {
+      importResult = await importDocument(file, uiLanguage);
+    } catch (error) {
+      console.error('[Import] failed:', error);
+      importResult = { success: false, title: file.name, content: '', error: t(uiLanguage, 'importFailed') };
+    }
+    if (mySession !== session.current) return; // dialog was closed meanwhile
     setResult(importResult);
     setIsProcessing(false);
 
-    // If successful, auto-import after a brief moment
+    const source: OpenSource = { name: file.name, handle };
+    // The same document (by id) is already in the app: ask instead of opening
+    if (importResult.success && importResult.penko && documents.some(d => d.id === importResult.penko!.doc.id)) {
+      setResult(null);
+      setConflict({ result: importResult, source });
+      return;
+    }
+
+    // If successful, auto-import after a brief moment (cancelled if the dialog closes)
     if (importResult.success) {
-      setTimeout(() => {
-        onImport(importResult.title, importResult.content);
-        handleClose();
+      autoImportTimer.current = window.setTimeout(() => {
+        autoImportTimer.current = null;
+        finishOpen(importResult, source, 'new');
       }, 1000);
     }
+  };
+
+  const finishOpen = (res: ImportResult, source: OpenSource, mode: 'new' | 'replace' | 'copy') => {
+    cancelAutoImport();
+    session.current++;
+    setResult(null);
+    setConflict(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    // closes the dialog
+    completeOpen(res, source, mode);
   };
 
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -59,6 +130,16 @@ const ImportDialog: React.FC<ImportDialogProps> = ({ isOpen, onClose, onImport, 
     }
   };
 
+  /** Chromium: the native picker, so the document stays linked to its file. */
+  const browse = async () => {
+    if (!files.canOpenInPlace) {
+      fileInputRef.current?.click();
+      return;
+    }
+    const picked = await files.pickFile();
+    if (picked) void handleFileSelect(picked.file, picked.handle);
+  };
+
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(true);
@@ -66,7 +147,8 @@ const ImportDialog: React.FC<ImportDialogProps> = ({ isOpen, onClose, onImport, 
 
   const handleDragLeave = (e: React.DragEvent) => {
     e.preventDefault();
-    setIsDragging(false);
+    // moving over a child element also fires dragleave on the zone
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setIsDragging(false);
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -80,7 +162,10 @@ const ImportDialog: React.FC<ImportDialogProps> = ({ isOpen, onClose, onImport, 
   };
 
   const handleClose = () => {
+    cancelAutoImport();
+    session.current++;
     setResult(null);
+    setConflict(null);
     setIsProcessing(false);
     setIsDragging(false);
     if (fileInputRef.current) {
@@ -89,11 +174,20 @@ const ImportDialog: React.FC<ImportDialogProps> = ({ isOpen, onClose, onImport, 
     onClose();
   };
 
+  useEscapeKey(isOpen, handleClose);
+
+  if (!isOpen) return null;
+
   const supportedExtensions = getSupportedExtensions();
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="import-dialog-title">
-      <div ref={dialogRef} className="bg-white dark:bg-[#1e1e1e] rounded-xl shadow-2xl max-w-2xl w-full mx-4 max-h-[90vh] overflow-hidden">
+    <div
+      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="import-dialog-title"
+    >
+      <div ref={dialogRef} className="bg-white dark:bg-[#1e1e1e] rounded-xl shadow-2xl max-w-2xl w-full mx-4 max-h-[90vh] overflow-y-auto">
         {/* Header */}
         <div className="flex items-center justify-between p-6 border-b border-gray-200 dark:border-gray-700">
           <div className="flex items-center gap-3">
@@ -102,10 +196,10 @@ const ImportDialog: React.FC<ImportDialogProps> = ({ isOpen, onClose, onImport, 
             </div>
             <div>
               <h2 id="import-dialog-title" className="text-xl font-semibold text-gray-900 dark:text-white">
-                {t(uiLanguage, 'importDocument')}
+                {t(uiLanguage, 'openFileTitle')}
               </h2>
               <p className="text-sm text-gray-500 dark:text-gray-400">
-                {t(uiLanguage, 'uploadDocument')}
+                {t(uiLanguage, 'openFileSubtitle')}
               </p>
             </div>
           </div>
@@ -120,19 +214,31 @@ const ImportDialog: React.FC<ImportDialogProps> = ({ isOpen, onClose, onImport, 
 
         {/* Content */}
         <div className="p-6">
+          {conflict ? (
+            <ConflictPanel
+              uiLanguage={uiLanguage}
+              appDoc={documents.find(d => d.id === conflict.result.penko!.doc.id)}
+              fileDoc={conflict.result.penko!.doc}
+              onReplace={() => finishOpen(conflict.result, conflict.source, 'replace')}
+              onKeepBoth={() => finishOpen(conflict.result, conflict.source, 'copy')}
+              onCancel={handleClose}
+            />
+          ) : (
+          <>
           {/* Drop Zone */}
           <div
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => !isProcessing && void browse()}
             role="button"
             tabIndex={0}
             aria-label={t(uiLanguage, 'dragDropFile')}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
+              // only when the zone itself has focus (not the "Try again" button inside it)
+              if (e.target === e.currentTarget && !isProcessing && (e.key === 'Enter' || e.key === ' ')) {
                 e.preventDefault();
-                fileInputRef.current?.click();
+                void browse();
               }
             }}
             className={`
@@ -254,7 +360,49 @@ const ImportDialog: React.FC<ImportDialogProps> = ({ isOpen, onClose, onImport, 
               </ul>
             </div>
           )}
+          </>
+          )}
         </div>
+      </div>
+    </div>
+  );
+};
+
+const ConflictPanel: React.FC<{
+  uiLanguage: LanguageCode;
+  appDoc: DocumentData | undefined;
+  fileDoc: DocumentData;
+  onReplace: () => void;
+  onKeepBoth: () => void;
+  onCancel: () => void;
+}> = ({ uiLanguage, appDoc, fileDoc, onReplace, onKeepBoth, onCancel }) => {
+  const when = (ms: number | undefined) => (ms ? new Date(ms).toLocaleString(uiLanguage) : '—');
+  return (
+    <div className="flex flex-col items-center gap-4 text-center py-4" role="alertdialog" aria-labelledby="import-conflict-title" aria-describedby="import-conflict-body">
+      <div className="w-16 h-16 bg-amber-100 dark:bg-amber-900/30 rounded-full flex items-center justify-center">
+        <Copy className="w-8 h-8 text-amber-600 dark:text-amber-400" />
+      </div>
+      <div>
+        <p id="import-conflict-title" className="text-lg font-medium text-gray-900 dark:text-white">
+          {t(uiLanguage, 'penkoConflictTitle')}
+        </p>
+        <p id="import-conflict-body" className="text-sm text-gray-600 dark:text-gray-400 mt-2 max-w-md">
+          {t(uiLanguage, 'penkoConflictBody')
+            .replace('{title}', fileDoc.title || appDoc?.title || t(uiLanguage, 'untitledDocument'))
+            .replace('{appDate}', when(appDoc?.lastModified))
+            .replace('{fileDate}', when(fileDoc.lastModified))}
+        </p>
+      </div>
+      <div className="flex flex-wrap justify-center gap-2 mt-2">
+        <button type="button" onClick={onReplace} data-autofocus className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors font-medium">
+          {t(uiLanguage, 'replaceAppCopy')}
+        </button>
+        <button type="button" onClick={onKeepBoth} className="px-4 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-lg transition-colors font-medium">
+          {t(uiLanguage, 'keepBoth')}
+        </button>
+        <button type="button" onClick={onCancel} className="px-4 py-2 text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white rounded-lg transition-colors">
+          {t(uiLanguage, 'cancel')}
+        </button>
       </div>
     </div>
   );

@@ -1,16 +1,53 @@
-import React, { createContext, useContext, useState, useEffect, useRef, useMemo } from 'react';
-import { DocumentData, PageConfig, EditorHandle, SelectionContext, Template, Comment, CommentReply, TrackChange, Citation } from './types';
-import { saveToStorage, loadFromStorage, createNewDocument, deleteFromStorage } from './utils/storage';
-import { saveSnapshot } from './utils/history';
-import { LanguageCode } from './utils/translations';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import type { Editor } from '@tiptap/core';
+import { DocumentData, PageConfig, SelectionContext, Template, Citation } from './types';
+import { LanguageCode, t, loadLanguage, isLanguageLoaded } from './utils/translations';
 import { useIsMobile } from './utils/hooks';
 import { useToast } from './utils/useToast';
+import { useDocumentStore } from './state/useDocumentStore';
+import { readLS, writeLS } from './utils/localPrefs';
+import { useEditingActions } from './state/useEditingActions';
+import { sectionBreaks, sectionOfPage, type SectionInfo, type SectionSettings } from './editor/extensions/sections';
+import { useReviewActions } from './state/useReviewActions';
+import { captureFormatting, applyFormatting, CopiedFormat } from './editor/commands';
+import type { CitationStyle } from './editor/citations';
+import type { TocStyle } from './editor/toc';
+import type { CollaborationConfig } from './editor/extensions';
+import type { StylesDialogRequest } from './utils/paragraphStyles';
+
+/* ------------------------------------------------------------------ */
+/* Context types                                                       */
+/* ------------------------------------------------------------------ */
+
+export type { PageNumberPosition, EditorStats, SelectedImageInfo } from './state/types';
+import type { PageNumberPosition, EditorStats, SelectedImageInfo } from './state/types';
 
 interface AppContextType {
+  // documents
   documents: DocumentData[];
-  setDocuments: React.Dispatch<React.SetStateAction<DocumentData[]>>;
   currentDoc: DocumentData | null;
-  setCurrentDoc: React.Dispatch<React.SetStateAction<DocumentData | null>>;
+  docsLoaded: boolean;
+  contentRevision: number;
+  updateCurrentDoc: (patch: Partial<DocumentData> | ((d: DocumentData) => Partial<DocumentData>)) => void;
+  flushPendingEdits: () => void;
+
+  // editor
+  editor: Editor | null;
+  setActiveEditor: (editor: Editor | null) => void;
+  registerEditorFlush: (fn: (() => void) | null) => void;
+  stats: EditorStats;
+  setStats: (s: EditorStats) => void;
+  /** Page containing the cursor and total pages (paginated layout). */
+  pageInfo: { current: number; total: number };
+  setPageInfo: React.Dispatch<React.SetStateAction<{ current: number; total: number }>>;
+  wordCount: number;
+  rawText: string;
+  selectedImage: SelectedImageInfo | null;
+  setSelectedImage: (img: SelectedImageInfo | null) => void;
+  collabSession: (CollaborationConfig & { docId: string }) | null;
+  setCollabSession: (s: (CollaborationConfig & { docId: string }) | null) => void;
+
+  // ui state
   isSidebarOpen: boolean;
   setIsSidebarOpen: React.Dispatch<React.SetStateAction<boolean>>;
   zoom: number;
@@ -36,6 +73,11 @@ interface AppContextType {
   showDiagramEditor: boolean;
   setShowDiagramEditor: React.Dispatch<React.SetStateAction<boolean>>;
   showHeaderFooter: boolean;
+  /** Section being edited in the header/footer dialog: section-break position, or null for the first section. */
+  headerFooterSectionPos: number | null;
+  /** Open the header/footer dialog for the section of `page` (default: the section at the cursor). */
+  openHeaderFooter: (target?: { page?: number }) => void;
+  handleSectionSettingsSave: (pos: number, settings: SectionSettings) => void;
   setShowHeaderFooter: React.Dispatch<React.SetStateAction<boolean>>;
   showLinkDialog: boolean;
   setShowLinkDialog: React.Dispatch<React.SetStateAction<boolean>>;
@@ -51,10 +93,14 @@ interface AppContextType {
   setShowCollaborationDialog: React.Dispatch<React.SetStateAction<boolean>>;
   showEquationDialog: boolean;
   setShowEquationDialog: React.Dispatch<React.SetStateAction<boolean>>;
+  editingEquation: { pos: number; latex: string; display: boolean } | null;
+  setEditingEquation: React.Dispatch<React.SetStateAction<{ pos: number; latex: string; display: boolean } | null>>;
   showTOCDialog: boolean;
   setShowTOCDialog: React.Dispatch<React.SetStateAction<boolean>>;
   showFootnoteDialog: boolean;
   setShowFootnoteDialog: React.Dispatch<React.SetStateAction<boolean>>;
+  editingFootnote: { pos: number; content: string; noteType: 'footnote' | 'endnote' } | null;
+  setEditingFootnote: React.Dispatch<React.SetStateAction<{ pos: number; content: string; noteType: 'footnote' | 'endnote' } | null>>;
   showCitationDialog: boolean;
   setShowCitationDialog: React.Dispatch<React.SetStateAction<boolean>>;
   showCodeBlockDialog: boolean;
@@ -63,76 +109,91 @@ interface AppContextType {
   setShowImageGallery: React.Dispatch<React.SetStateAction<boolean>>;
   showKeyboardShortcuts: boolean;
   setShowKeyboardShortcuts: React.Dispatch<React.SetStateAction<boolean>>;
-  selectedImage: HTMLImageElement | null;
-  setSelectedImage: React.Dispatch<React.SetStateAction<HTMLImageElement | null>>;
+  /** Styles dialog (manage / modify / new named paragraph style), null when closed. */
+  stylesDialog: StylesDialogRequest | null;
+  setStylesDialog: (request: StylesDialogRequest | null) => void;
+  showFocusMode: boolean;
+  setShowFocusMode: React.Dispatch<React.SetStateAction<boolean>>;
+  pendingCommentId: string | null;
+  setPendingCommentId: React.Dispatch<React.SetStateAction<string | null>>;
   currentUser: string;
-  setCurrentUser: React.Dispatch<React.SetStateAction<string>>;
+  setCurrentUser: (name: string) => void;
   darkMode: boolean;
   setDarkMode: React.Dispatch<React.SetStateAction<boolean>>;
-  wordCount: number;
-  setWordCount: React.Dispatch<React.SetStateAction<number>>;
-  rawText: string;
-  setRawText: React.Dispatch<React.SetStateAction<string>>;
-  zenMode: boolean;
-  setZenMode: React.Dispatch<React.SetStateAction<boolean>>;
   pasteAsPlainText: boolean;
   setPasteAsPlainText: React.Dispatch<React.SetStateAction<boolean>>;
   uiLanguage: LanguageCode;
   setUiLanguage: React.Dispatch<React.SetStateAction<LanguageCode>>;
   isRibbonCollapsed: boolean;
   setIsRibbonCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
-  showFocusMode: boolean;
-  setShowFocusMode: React.Dispatch<React.SetStateAction<boolean>>;
   typewriterMode: boolean;
   setTypewriterMode: React.Dispatch<React.SetStateAction<boolean>>;
   wordGoal: number | undefined;
   setWordGoal: React.Dispatch<React.SetStateAction<number | undefined>>;
-  selectionContext: SelectionContext;
-  setSelectionContext: React.Dispatch<React.SetStateAction<SelectionContext>>;
-  editorRef: React.RefObject<EditorHandle | null>;
   isMobile: boolean;
   toast: ReturnType<typeof useToast>;
 
-  // Actions
-  handleNewDoc: () => void;
+  // document actions
+  handleNewDoc: () => DocumentData;
+  handleCreateDocument: (data: Partial<DocumentData>, opts?: { select?: boolean; keepIdentity?: boolean }) => DocumentData;
+  /** Replace a document with another version of it (same id, e.g. from a .penko file) and show it. */
+  handleReplaceDocument: (doc: DocumentData, fields: readonly string[]) => void;
   handleRemoveFromHistory: (docId: string) => void;
+  handleDeleteDocument: (docId: string) => void;
   handleTemplateSelect: (template: Template) => void;
-  handleImportDocument: (title: string, content: string) => void;
+  handleImportDocument: (title: string, content: string, extra?: Partial<DocumentData>) => void;
   handleOpenDoc: (id: string) => void;
-  handleContentChange: (html: string, text: string) => void;
+  /** Replace the current document's HTML from outside the main editor. */
+  /** Replace a document's HTML from outside the editor (defaults to the current document). */
+  handleContentChange: (html: string, docId?: string) => void;
   handleTitleChange: (newTitle: string) => void;
   handlePageConfigChange: (config: Partial<PageConfig>) => void;
   handleLanguageChange: (lang: string) => void;
+  handleSaveNow: () => Promise<void>;
+
+  // editing actions
   executeCommand: (command: string, value?: string | null) => void;
   handleTableAction: (action: string, value?: any) => void;
   handleImageAction: (action: string, value?: any) => void;
+  updateSelectedImage: (patch: { attrs?: Record<string, any>; style?: Record<string, string | null> }) => void;
+  deleteSelectedImage: () => void;
   handleReplaceImage: () => void;
-  handleContextChange: (ctx: SelectionContext) => void;
+  handleInsertImageFiles: (files: File[] | FileList) => Promise<void>;
   handleRestoreVersion: (content: string) => void;
-  handleApplyCorrection: (original: string, correction: string) => void;
+  handleApplyCorrection: (original: string, correction: string, textOffset?: number) => boolean;
   handleHeaderFooterSave: (data: {
     header: string;
     footer: string;
     showPageNumbers: boolean;
-    pageNumberPosition: 'header-left' | 'header-center' | 'header-right' | 'footer-left' | 'footer-center' | 'footer-right';
+    pageNumberPosition: PageNumberPosition;
+    differentFirstPage?: boolean;
+    pageNumberFormat?: 'decimal' | 'roman' | 'page-of';
   }) => void;
   handleOpenLinkDialog: () => void;
   handleInsertLink: (url: string, text: string) => void;
   handleRemoveLink: () => void;
-  handleInsertEquation: (latex: string) => void;
-  handleInsertTOC: (tocHTML: string) => void;
-  handleInsertFootnote: (noteData: { type: 'footnote' | 'endnote'; content: string; number: number }) => void;
+  handleInsertEquation: (latex: string, display?: boolean) => void;
+  handleInsertTOC: (opts?: { style?: TocStyle; levels?: number[] }) => void;
+  handleInsertFootnote: (noteData: { type: 'footnote' | 'endnote'; content: string; number?: number }) => void;
+  handleUpdateFootnote: (pos: number, content: string) => void;
   handleAddCitation: (citation: Citation) => void;
+  handleUpdateCitation: (citation: Citation) => void;
   handleDeleteCitation: (citationId: string) => void;
-  handleInsertCitation: (citationId: string, style: 'apa' | 'mla' | 'chicago' | 'bibtex') => void;
-  handleInsertBibliography: (style: 'apa' | 'mla' | 'chicago' | 'bibtex') => void;
-  handleInsertCodeBlock: (code: string, language: string, theme: string) => void;
+  handleInsertCitation: (citationId: string, style: CitationStyle) => void;
+  handleInsertBibliography: (style: CitationStyle) => void;
+  handleInsertCodeBlock: (code: string, language: string, theme: string, lineNumbers?: boolean) => void;
+  handleInsertDiagram: (dataUrl: string, alt?: string) => void;
+  handleInsertPageBreak: () => void;
+
+  // comments / review
   handleAddComment: (text: string, rangeId: string) => void;
   handleReplyToComment: (commentId: string, text: string) => void;
   handleResolveComment: (commentId: string) => void;
+  handleReopenComment: (commentId: string) => void;
   handleDeleteComment: (commentId: string) => void;
   handleHighlightComment: (commentId: string) => void;
   handleCreateCommentFromSelection: () => void;
+  handleCancelPendingComment: () => void;
   handleToggleTracking: () => void;
   handleToggleScreenplay: () => void;
   handleToggleMarkdown: () => void;
@@ -141,10 +202,14 @@ interface AppContextType {
   handleAcceptAllChanges: () => void;
   handleRejectAllChanges: () => void;
   handleHighlightChange: (changeId: string) => void;
-  copiedFormatting: SelectionContext | null;
-  setCopiedFormatting: (fmt: SelectionContext | null) => void;
+
+  // paint format
+  copiedFormatting: CopiedFormat | null;
+  setCopiedFormatting: (fmt: CopiedFormat | null) => void;
   isPaintingFormat: boolean;
   setIsPaintingFormat: (v: boolean) => void;
+  startPaintFormat: () => void;
+  applyPaintFormat: () => void;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -155,12 +220,45 @@ export const useApp = () => {
   return context;
 };
 
+/** Selection-driven toolbar state lives in its own context so typing doesn't re-render the app. */
+const SelectionCtx = createContext<SelectionContext | undefined>(undefined);
+const SelectionSetterCtx = createContext<((c: SelectionContext) => void) | undefined>(undefined);
+export const useSelectionContext = () => {
+  const selectionContext = useContext(SelectionCtx);
+  const setSelectionContext = useContext(SelectionSetterCtx);
+  if (!selectionContext || !setSelectionContext) throw new Error('useSelectionContext must be used within an AppProvider');
+  return { selectionContext, setSelectionContext };
+};
+/** Setter only — components that report selection changes don't re-render on them. */
+export const useSetSelectionContext = () => {
+  const set = useContext(SelectionSetterCtx);
+  if (!set) throw new Error('useSetSelectionContext must be used within an AppProvider');
+  return set;
+};
+
+const shallowEqual = (a: Record<string, any>, b: Record<string, any>) => {
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  return ka.every(k => a[k] === b[k] || (typeof a[k] === 'object' && a[k] && b[k] && JSON.stringify(a[k]) === JSON.stringify(b[k])));
+};
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [documents, setDocuments] = useState<DocumentData[]>([]);
-  const [currentDoc, setCurrentDoc] = useState<DocumentData | null>(null);
+
+  const [editor, setEditor] = useState<Editor | null>(null);
+  const editorRef = useRef<Editor | null>(null);
+  editorRef.current = editor;
+  const editorFlushRef = useRef<(() => void) | null>(null);
+  const [stats, setStats] = useState<EditorStats>({ words: 0, characters: 0, text: '' });
+  const [pageInfo, setPageInfo] = useState<{ current: number; total: number }>({ current: 1, total: 1 });
+  const [selectedImage, setSelectedImage] = useState<SelectedImageInfo | null>(null);
+  const [collabSession, setCollabSession] = useState<(CollaborationConfig & { docId: string }) | null>(null);
+  const [selectionContext, setSelectionContextState] = useState<SelectionContext>({ type: 'text' });
+  // Skip identical updates: moving the caret within same-formatted text shouldn't re-render the toolbar
+  const setSelectionContext = useCallback((next: SelectionContext) => setSelectionContextState(prev => (shallowEqual(prev, next) ? prev : next)), []);
+
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [zoom, setZoom] = useState(100);
-  const [showRuler, setShowRuler] = useState(true);
+  const [showRuler, setShowRuler] = useState(() => readLS('penko_writer_show_ruler') !== 'false');
   const [showSearch, setShowSearch] = useState(false);
   const [showSpellCheck, setShowSpellCheck] = useState(false);
   const [showStats, setShowStats] = useState(false);
@@ -171,6 +269,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [showOutline, setShowOutline] = useState(false);
   const [showDiagramEditor, setShowDiagramEditor] = useState(false);
   const [showHeaderFooter, setShowHeaderFooter] = useState(false);
+  const [headerFooterSectionPos, setHeaderFooterSectionPos] = useState<number | null>(null);
   const [showLinkDialog, setShowLinkDialog] = useState(false);
   const [existingLink, setExistingLink] = useState<{ url: string; text: string } | null>(null);
   const [showCommentsPanel, setShowCommentsPanel] = useState(false);
@@ -178,1050 +277,289 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [showCollaborationDialog, setShowCollaborationDialog] = useState(false);
   const [showEquationDialog, setShowEquationDialog] = useState(false);
+  const [editingEquation, setEditingEquation] = useState<{ pos: number; latex: string; display: boolean } | null>(null);
   const [showTOCDialog, setShowTOCDialog] = useState(false);
   const [showFootnoteDialog, setShowFootnoteDialog] = useState(false);
+  const [editingFootnote, setEditingFootnote] = useState<{ pos: number; content: string; noteType: 'footnote' | 'endnote' } | null>(null);
   const [showCitationDialog, setShowCitationDialog] = useState(false);
   const [showCodeBlockDialog, setShowCodeBlockDialog] = useState(false);
   const [showImageGallery, setShowImageGallery] = useState(false);
   const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false);
-  const [selectedImage, setSelectedImage] = useState<HTMLImageElement | null>(null);
-  const [currentUser, setCurrentUser] = useState('User');
-  const [darkMode, setDarkMode] = useState(false);
-  const [wordCount, setWordCount] = useState(0);
-  const [rawText, setRawText] = useState('');
-  const [zenMode, setZenMode] = useState(false);
-  const [pasteAsPlainText, setPasteAsPlainText] = useState(false);
-  const [uiLanguage, setUiLanguage] = useState<LanguageCode>('en-US');
-  const [isRibbonCollapsed, setIsRibbonCollapsed] = useState(false);
+  const [stylesDialog, setStylesDialog] = useState<StylesDialogRequest | null>(null);
   const [showFocusMode, setShowFocusMode] = useState(false);
+  const [pendingCommentId, setPendingCommentId] = useState<string | null>(null);
+  const [currentUser, setCurrentUserState] = useState(() => readLS('penko_writer_user_name') || 'User');
+  const [darkMode, setDarkMode] = useState(() => readLS('penko_writer_theme', 'cloudword_theme') === 'dark');
+  const [pasteAsPlainText, setPasteAsPlainText] = useState(() => readLS('penko_writer_paste_plain') === 'true');
+  const [uiLanguage, setUiLanguage] = useState<LanguageCode>(() => (readLS('penko_writer_ui_lang', 'cloudword_ui_lang') as LanguageCode) || 'en-US');
+  const [isRibbonCollapsed, setIsRibbonCollapsed] = useState(false);
+  const [, setLanguageTick] = useState(0);
   const [typewriterMode, setTypewriterMode] = useState(false);
   const [wordGoal, setWordGoal] = useState<number | undefined>(undefined);
-
-  const [selectionContext, setSelectionContext] = useState<SelectionContext>({ type: 'text' });
-  const [copiedFormatting, setCopiedFormatting] = useState<SelectionContext | null>(null);
+  const [copiedFormatting, setCopiedFormatting] = useState<CopiedFormat | null>(null);
   const [isPaintingFormat, setIsPaintingFormat] = useState(false);
-  const [pendingStyles, setPendingStyles] = useState<{ fontName?: string; fontSize?: string } | null>(null);
-  const editorRef = useRef<EditorHandle | null>(null);
 
-  const isMobile = useIsMobile(768);
+  // Switching layouts remounts the editor: commit pending edits first
+  const isMobile = useIsMobile(768, () => editorFlushRef.current?.());
   const toast = useToast();
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
+  const uiLangRef = useRef(uiLanguage);
+  uiLangRef.current = uiLanguage;
 
-  // Initialize
+  const {
+    docState,
+    currentDoc,
+    currentDocRef,
+    documents,
+    flushPendingEdits,
+    updateDoc,
+    updateCurrentDoc,
+    handleCreateDocument,
+    handleNewDoc,
+    handleDeleteDocument,
+    handleTemplateSelect,
+    handleImportDocument,
+    handleOpenDoc,
+    handleReplaceDocument,
+    handleContentChange,
+    handleTitleChange,
+    handlePageConfigChange,
+    handleLanguageChange,
+    handleSaveNow,
+  } = useDocumentStore({ editorFlushRef, toastRef, uiLangRef, setIsSidebarOpen, setShowTemplates, setShowImportDialog });
+
+
+  /* ---------------------------- settings --------------------------- */
+
   useEffect(() => {
-    const savedDocs = loadFromStorage();
-    setDocuments(savedDocs);
-    if (savedDocs.length > 0) {
-      setCurrentDoc(savedDocs[0]);
-    } else {
-      handleNewDoc();
-    }
-
-    let savedTheme = localStorage.getItem('penko_writer_theme');
-    if (!savedTheme) {
-      const oldTheme = localStorage.getItem('cloudword_theme');
-      if (oldTheme) {
-        localStorage.setItem('penko_writer_theme', oldTheme);
-        savedTheme = oldTheme;
-      }
-    }
-    if (savedTheme === 'dark') setDarkMode(true);
-
-    let savedUiLang = localStorage.getItem('penko_writer_ui_lang');
-    if (!savedUiLang) {
-      const oldUiLang = localStorage.getItem('cloudword_ui_lang');
-      if (oldUiLang) {
-        localStorage.setItem('penko_writer_ui_lang', oldUiLang);
-        savedUiLang = oldUiLang;
-      }
-    }
-    if (savedUiLang) setUiLanguage(savedUiLang as LanguageCode);
-  }, []);
-
-  // Keyboard Shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'b') {
-        e.preventDefault();
-        executeCommand('bold');
-      } else if ((e.ctrlKey || e.metaKey) && e.key === 'i') {
-        e.preventDefault();
-        executeCommand('italic');
-      } else if ((e.ctrlKey || e.metaKey) && e.key === 'u') {
-        e.preventDefault();
-        executeCommand('underline');
-      } else if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-        e.preventDefault();
-        if (currentDoc) {
-          saveToStorage(currentDoc);
-          toast.success('Document saved!');
-        }
-      } else if ((e.ctrlKey || e.metaKey) && e.key === 'p') {
-        e.preventDefault();
-        window.print();
-      } else if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
-        e.preventDefault();
-        setShowSearch(true);
-      } else if ((e.ctrlKey || e.metaKey) && e.key === 'o') {
-        e.preventDefault();
-        setShowImportDialog(true);
-      } else if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
-        e.preventDefault();
-        executeCommand('undo');
-      } else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
-        e.preventDefault();
-        executeCommand('redo');
-      } else if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-        e.preventDefault();
-        handleOpenLinkDialog();
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [currentDoc]);
-
-  // Persist Theme & Language
-  useEffect(() => {
-    localStorage.setItem('penko_writer_theme', darkMode ? 'dark' : 'light');
-    if (darkMode) {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-    }
+    writeLS('penko_writer_theme', darkMode ? 'dark' : 'light');
+    document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
+  useEffect(() => writeLS('penko_writer_show_ruler', String(showRuler)), [showRuler]);
+  useEffect(() => writeLS('penko_writer_paste_plain', String(pasteAsPlainText)), [pasteAsPlainText]);
 
   useEffect(() => {
-    localStorage.setItem('penko_writer_ui_lang', uiLanguage);
+    writeLS('penko_writer_ui_lang', uiLanguage);
+    // Non-English strings are code-split; re-render once they arrive
+    if (!isLanguageLoaded(uiLanguage)) void loadLanguage(uiLanguage).then(() => setLanguageTick(n => n + 1));
+    document.documentElement.lang = uiLanguage;
+    document.documentElement.dir = uiLanguage === 'ar' ? 'rtl' : 'ltr';
+    document.documentElement.style.setProperty('--penko-page-break-label', JSON.stringify(t(uiLanguage, 'pageBreak')));
+    document.documentElement.style.setProperty('--penko-section-break-label', JSON.stringify(t(uiLanguage, 'sectionBreakNextPage')));
   }, [uiLanguage]);
 
-  // Auto-save
+  const setCurrentUser = useCallback((name: string) => {
+    const clean = name.trim() || 'User';
+    setCurrentUserState(clean);
+    writeLS('penko_writer_user_name', clean);
+  }, []);
+
+  // An unfinished comment belongs to the document it was started in: when the
+  // user switches away, drop its highlight from that document instead of
+  // leaving an empty comment mark behind.
+  const pendingCommentRef = useRef<{ id: string | null; docId: string | null }>({ id: null, docId: null });
   useEffect(() => {
-    if (!currentDoc) return;
+    const prev = pendingCommentRef.current;
+    if (prev.id && prev.docId && prev.docId !== currentDoc?.id) {
+      const { id, docId } = prev;
+      updateDoc(
+        docId,
+        d => {
+          const body = new DOMParser().parseFromString(`<body>${d.content}</body>`, 'text/html').body;
+          body.querySelectorAll(`[data-comment-id="${CSS.escape(id)}"]`).forEach(el => el.replaceWith(...Array.from(el.childNodes)));
+          return { content: body.innerHTML };
+        },
+        { touch: false },
+      );
+      setPendingCommentId(null);
+      pendingCommentRef.current = { id: null, docId: null };
+      return;
+    }
+    pendingCommentRef.current = pendingCommentId
+      ? { id: pendingCommentId, docId: prev.id === pendingCommentId ? prev.docId : currentDoc?.id ?? null }
+      : { id: null, docId: null };
+  }, [currentDoc?.id, pendingCommentId, updateDoc]);
 
-    const timer = setTimeout(() => {
-      saveToStorage(currentDoc);
-      setDocuments(prev => prev.map(d => d.id === currentDoc.id ? currentDoc : d));
-    }, 1000);
-
-    return () => {
-      clearTimeout(timer);
-    };
-  }, [currentDoc]);
-
-  // Smart snapshot system
+  // Track-changes author follows the user name
   useEffect(() => {
-    if (!currentDoc) return;
+    if (editor && currentDoc) editor.commands.setTrackChanges(!!currentDoc.trackingEnabled, currentUser);
+  }, [editor, currentDoc?.trackingEnabled, currentUser]);
 
-    const snapshotTimer = setTimeout(() => {
-      saveSnapshot(currentDoc);
-    }, 5000);
+  /* ---------------------------- editing ---------------------------- */
 
-    return () => {
-      clearTimeout(snapshotTimer);
-    };
-  }, [currentDoc]);
+  const editing = useEditingActions({
+    editor,
+    editorRef,
+    currentDoc,
+    currentDocRef,
+    editingEquation,
+    setEditingEquation,
+    selectedImage,
+    setSelectedImage,
+    setExistingLink,
+    setShowLinkDialog,
+    setShowHeaderFooter,
+    setShowDiagramEditor,
+    setZoom,
+    toastRef,
+    uiLangRef,
+    updateCurrentDoc,
+    updateDoc,
+    flushPendingEdits,
+  });
+  const {
+    executeCommand,
+    handleTableAction,
+    updateSelectedImage,
+    deleteSelectedImage,
+    handleImageAction,
+    handleInsertImageFiles,
+    handleReplaceImage,
+    handleRestoreVersion,
+    handleApplyCorrection,
+    handleHeaderFooterSave,
+    handleOpenLinkDialog,
+    handleInsertLink,
+    handleRemoveLink,
+    handleInsertEquation,
+    handleInsertTOC,
+    handleInsertFootnote,
+    handleUpdateFootnote,
+    handleAddCitation,
+    handleUpdateCitation,
+    handleDeleteCitation,
+    handleInsertCitation,
+    handleInsertBibliography,
+    handleInsertCodeBlock,
+    handleInsertDiagram,
+    handleInsertPageBreak,
+    handleSectionSettingsSave,
+  } = editing;
 
-  const handleNewDoc = () => {
-    const newDoc = createNewDocument();
-    setDocuments(prev => [newDoc, ...prev]);
-    setCurrentDoc(newDoc);
-  };
-
-  const handleRemoveFromHistory = (docId: string) => {
-    deleteFromStorage(docId);
-    setDocuments(prev => prev.filter(doc => doc.id !== docId));
-    if (currentDoc?.id === docId) {
-      const remaining = documents.filter(doc => doc.id !== docId);
-      if (remaining.length > 0) {
-        setCurrentDoc(remaining[0]);
+  const openHeaderFooter = useCallback((target: { page?: number } = {}) => {
+    const ed = editorRef.current;
+    let pos: number | null = null;
+    if (ed && !ed.isDestroyed) {
+      if (target.page) {
+        const sections: SectionInfo[] = (ed.storage as any).pagination?.sections || [];
+        pos = sectionOfPage(target.page, sections)?.pos ?? null;
       } else {
-        handleNewDoc();
+        const at = ed.state.selection.from;
+        for (const sb of sectionBreaks(ed.state.doc)) if (sb.pos < at) pos = sb.pos;
       }
     }
-  };
+    setHeaderFooterSectionPos(pos);
+    setShowHeaderFooter(true);
+  }, []);
 
-  const handleTemplateSelect = (template: Template) => {
-    const newDoc = createNewDocument();
-    newDoc.title = template.name;
-    newDoc.content = template.content;
-    if (template.pageConfig) {
-      newDoc.pageConfig = template.pageConfig;
-    }
-    if (template.isScreenplay) {
-      newDoc.isScreenplay = true;
-    }
-    setDocuments(prev => [newDoc, ...prev]);
-    setCurrentDoc(newDoc);
-    setShowTemplates(false);
-    toast.success(`Template "${template.name}" loaded!`);
-  };
+  /* ------------------------ comments / review ----------------------- */
 
-  const handleImportDocument = (title: string, content: string) => {
-    const newDoc = createNewDocument();
-    newDoc.title = title;
-    newDoc.content = content;
-    setDocuments(prev => [newDoc, ...prev]);
-    setCurrentDoc(newDoc);
-    setShowImportDialog(false);
-    toast.success('Document imported successfully!');
-  };
+  const {
+    handleAddComment,
+    handleReplyToComment,
+    handleResolveComment,
+    handleReopenComment,
+    handleDeleteComment,
+    handleHighlightComment,
+    handleCreateCommentFromSelection,
+    handleCancelPendingComment,
+    handleToggleTracking,
+    handleToggleScreenplay,
+    handleToggleMarkdown,
+    handleAcceptChange,
+    handleRejectChange,
+    handleAcceptAllChanges,
+    handleRejectAllChanges,
+    handleHighlightChange,
+  } = useReviewActions({ editorRef, currentDocRef, currentUser, setPendingCommentId, setShowCommentsPanel, toastRef, uiLangRef, updateCurrentDoc, flushPendingEdits });
 
-  const handleOpenDoc = (id: string) => {
-    const doc = documents.find(d => d.id === id);
-    if (doc) setCurrentDoc(doc);
-    setIsSidebarOpen(false);
-  };
+  /* --------------------------- paint format ------------------------- */
 
-  const handleContentChange = (html: string, text: string) => {
-    if (pendingStyles) {
-      setPendingStyles(null);
-    }
-    if (!currentDoc) return;
-    const safeText = text || '';
-    const count = safeText.trim() === '' ? 0 : safeText.trim().split(/\s+/).length;
-    setWordCount(count);
-    setRawText(safeText);
-    setCurrentDoc(prev => prev ? { ...prev, content: html, lastModified: Date.now() } : null);
-  };
+  const startPaintFormat = useCallback(() => {
+    const ed = editorRef.current;
+    if (!ed) return;
+    setCopiedFormatting(captureFormatting(ed));
+    setIsPaintingFormat(true);
+  }, []);
 
-  const handleTitleChange = (newTitle: string) => {
-    if (!currentDoc) return;
-    setCurrentDoc(prev => prev ? { ...prev, title: newTitle, lastModified: Date.now() } : null);
-  };
+  const applyPaintFormat = useCallback(() => {
+    const ed = editorRef.current;
+    if (!ed || !copiedFormattingRef.current) return;
+    applyFormatting(ed, copiedFormattingRef.current);
+    setIsPaintingFormat(false);
+    toastRef.current.success(t(uiLangRef.current, 'formatApplied'));
+  }, []);
+  const copiedFormattingRef = useRef(copiedFormatting);
+  copiedFormattingRef.current = copiedFormatting;
 
-  const handlePageConfigChange = (config: Partial<PageConfig>) => {
-    if (!currentDoc) return;
-    setCurrentDoc(prev => prev ? { 
-        ...prev, 
-        pageConfig: { ...(prev.pageConfig || { size: 'A4', orientation: 'portrait', margins: 'normal', cols: 1 }), ...config },
-        lastModified: Date.now() 
-    } : null);
-  };
+  /* ------------------------ keyboard shortcuts ---------------------- */
 
-  const handleLanguageChange = (lang: string) => {
-    if (!currentDoc) return;
-    setCurrentDoc(prev => prev ? { ...prev, language: lang, lastModified: Date.now() } : null);
-  };
-
-  const executeCommand = (command: string, value: string | null = null) => {
-    const selection = window.getSelection();
-
-    if (command === 'zoom') {
-       setZoom(parseInt(value || '100'));
-       return;
-    }
-
-    if (command === 'fontName' && value) {
-      if (selection && selection.isCollapsed && selection.rangeCount > 0) {
-        const range = selection.getRangeAt(0);
-        const span = document.createElement('span');
-        span.style.fontFamily = value;
-        span.style.fontSize = (selectionContext.fontSize || '11') + 'pt';
-        span.innerHTML = '&#8203;'; // Zero-width space
-        range.insertNode(span);
-        
-        range.setStart(span.firstChild!, 1);
-        range.setEnd(span.firstChild!, 1);
-        selection.removeAllRanges();
-        selection.addRange(range);
-        
-        setSelectionContext(prev => ({
-          ...prev,
-          fontName: value
-        }));
-        if (editorRef.current) editorRef.current.focus();
-        return;
-      } else if (selection && !selection.isCollapsed) {
-        document.execCommand('fontName', false, value);
-        setSelectionContext(prev => ({
-          ...prev,
-          fontName: value
-        }));
-        if (editorRef.current) editorRef.current.focus();
-        return;
-      }
-    }
-
-    if (command === 'fontSize' && value) {
-      if (selection && selection.isCollapsed && selection.rangeCount > 0) {
-        if (value !== 'grow' && value !== 'shrink') {
-          const range = selection.getRangeAt(0);
-          const span = document.createElement('span');
-          span.style.fontFamily = selectionContext.fontName || 'Arial';
-          span.style.fontSize = value + 'pt';
-          span.innerHTML = '&#8203;'; // Zero-width space
-          range.insertNode(span);
-          
-          range.setStart(span.firstChild!, 1);
-          range.setEnd(span.firstChild!, 1);
-          selection.removeAllRanges();
-          selection.addRange(range);
-          
-          setSelectionContext(prev => ({
-            ...prev,
-            fontSize: value
-          }));
-          if (editorRef.current) editorRef.current.focus();
-          return;
-        }
-      }
-      
-      if (selection && !selection.isCollapsed) {
-          const range = selection.getRangeAt(0);
-          let size = 11;
-          if (value === 'grow' || value === 'shrink') {
-            let parent = range.commonAncestorContainer as HTMLElement;
-            if (parent.nodeType === Node.TEXT_NODE) {
-              parent = parent.parentElement as HTMLElement;
-            }
-            const closestSpan = parent.closest('span');
-            if (closestSpan && closestSpan.style.fontSize) {
-              size = parseFloat(closestSpan.style.fontSize) || 11;
-            }
-            size = value === 'grow' ? size + 1 : Math.max(6, size - 1);
-          } else {
-            size = parseFloat(value) || 11;
-          }
-          const span = document.createElement('span');
-          span.style.fontSize = size + 'pt';
-          const fragment = range.extractContents();
-          span.appendChild(fragment);
-          range.insertNode(span);
-          
-          setSelectionContext(prev => ({
-            ...prev,
-            fontSize: size.toString()
-          }));
-      }
-      if (editorRef.current) editorRef.current.focus();
-      return;
-    }
-
-    if (command === 'textCase' && value) {
-      const selection = window.getSelection();
-      if (selection && !selection.isCollapsed) {
-        const range = selection.getRangeAt(0);
-        let text = selection.toString();
-        if (value === 'uppercase') {
-          text = text.toUpperCase();
-        } else if (value === 'lowercase') {
-          text = text.toLowerCase();
-        } else if (value === 'capitalize') {
-          text = text.replace(/\b\w/g, c => c.toUpperCase());
-        }
-        range.deleteContents();
-        range.insertNode(document.createTextNode(text));
-      }
-      if (editorRef.current) editorRef.current.focus();
-      return;
-    }
-
-    if (command === 'paragraphBackground' && value) {
-      const selection = window.getSelection();
-      if (selection && selection.rangeCount > 0) {
-        const range = selection.getRangeAt(0);
-        let parent = range.commonAncestorContainer as HTMLElement;
-        if (parent.nodeType === Node.TEXT_NODE) {
-          parent = parent.parentElement as HTMLElement;
-        }
-        const block = parent.closest('p, div, li, td, h1, h2, h3, h4, h5, h6');
-        if (block && block.setAttribute) {
-          block.style.backgroundColor = value;
-        } else {
-          parent.style.backgroundColor = value;
-        }
-        
-        if (editorRef.current) {
-          const html = editorRef.current.getInnerHtml();
-          const textContent = editorRef.current.getInnerText();
-          handleContentChange(html, textContent);
-        }
-      }
-      if (editorRef.current) editorRef.current.focus();
-      return;
-    }
-
-    if (command === 'insertSymbol' && value) {
-      const selection = window.getSelection();
-      if (selection && selection.rangeCount > 0) {
-        const range = selection.getRangeAt(0);
-        range.deleteContents();
-        range.insertNode(document.createTextNode(value));
-      }
-      if (editorRef.current) editorRef.current.focus();
-      return;
-    }
-
-    if (command === 'lineHeight' && value) {
-      const selection = window.getSelection();
-      if (selection && selection.rangeCount > 0) {
-        const range = selection.getRangeAt(0);
-        let parent = range.commonAncestorContainer as HTMLElement;
-        if (parent.nodeType === Node.TEXT_NODE) {
-          parent = parent.parentElement as HTMLElement;
-        }
-        const block = parent.closest('p, div, li, td, h1, h2, h3, h4, h5, h6');
-        if (block && block.setAttribute) {
-          block.style.lineHeight = value;
-        } else {
-          parent.style.lineHeight = value;
-        }
-        
-        if (editorRef.current) {
-          const html = editorRef.current.getInnerHtml();
-          const textContent = editorRef.current.getInnerText();
-          handleContentChange(html, textContent);
-        }
-      }
-      if (editorRef.current) editorRef.current.focus();
-      return;
-    }
-
-    document.execCommand(command, false, value ?? undefined);
-    if (editorRef.current) {
-      editorRef.current.focus();
-    }
-  };
-
-  const handleTableAction = (action: string, value?: any) => {
-      if(!editorRef.current) return;
-      if (action === 'addRow') editorRef.current.addTableRow();
-      if (action === 'delRow') editorRef.current.deleteTableRow();
-      if (action === 'addCol') editorRef.current.addTableColumn();
-      if (action === 'delCol') editorRef.current.deleteTableColumn();
-      if (action === 'mergeCells') editorRef.current.mergeCells();
-      if (action === 'splitCell') editorRef.current.splitCell();
-      if (action === 'setStyle') editorRef.current.setTableStyle(value);
-      if (action === 'setWidth') editorRef.current.setColumnWidth(value);
-  };
-
-  const handleImageAction = (action: string, value?: any) => {
-      if(!editorRef.current) return;
-      if (action === 'resize') editorRef.current.resizeImage(value);
-      if (action === 'align') editorRef.current.alignImage(value);
-      if (action === 'rotate') editorRef.current.rotateImage(value);
-      if (action === 'border') editorRef.current.setImageBorder(value);
-      if (action === 'replace') handleReplaceImage();
-  };
-
-  const handleReplaceImage = () => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = 'image/*';
-    input.onchange = async (e) => {
-      const file = (e.target as HTMLInputElement).files?.[0];
-      if (file && editorRef.current) {
-        const reader = new FileReader();
-        reader.onload = async (event) => {
-          if (event.target?.result) {
-            let dataUrl = event.target.result as string;
-            const { compressImage, shouldCompressImage } = await import('./utils/imageUtils');
-            if (shouldCompressImage(dataUrl)) {
-              dataUrl = await compressImage(dataUrl);
-            }
-            await editorRef.current?.replaceImage(dataUrl);
-          }
-        };
-        reader.readAsDataURL(file);
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      const key = e.key.toLowerCase();
+      const target = e.target as HTMLElement | null;
+      const inField = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT');
+      const inEditor = !!target && !!editorRef.current && editorRef.current.view.dom.contains(target);
+      if (key === 's' && !e.shiftKey) { // Ctrl+Shift+S is strikethrough
+        e.preventDefault();
+        void handleSaveNowRef.current();
+      } else if (key === 'p' && !e.shiftKey) {
+        e.preventDefault();
+        flushPendingEdits();
+        void import('./utils/print').then(m => m.printCurrentDocument());
+      } else if (key === 'f' && !inField) {
+        e.preventDefault();
+        setShowSearch(true);
+      } else if (key === 'h' && !e.shiftKey && !inField) { // Ctrl+Shift+H is highlight
+        e.preventDefault();
+        setShowSearch(true);
+      } else if (key === 'o' && !inField) {
+        e.preventDefault();
+        setShowImportDialog(true);
+      } else if (key === 'k' && inEditor) {
+        e.preventDefault();
+        handleOpenLinkDialog();
+      } else if (key === '/' && !inField) {
+        e.preventDefault();
+        setShowKeyboardShortcuts(true);
       }
     };
-    input.click();
-  };
-
-  const applyFormatting = (format: SelectionContext) => {
-    if (!format) return;
-    if (format.bold !== undefined) {
-      const isCurrentlyBold = document.queryCommandState('bold');
-      if (!!format.bold !== isCurrentlyBold) executeCommand('bold');
-    }
-    if (format.italic !== undefined) {
-      const isCurrentlyItalic = document.queryCommandState('italic');
-      if (!!format.italic !== isCurrentlyItalic) executeCommand('italic');
-    }
-    if (format.underline !== undefined) {
-      const isCurrentlyUnderline = document.queryCommandState('underline');
-      if (!!format.underline !== isCurrentlyUnderline) executeCommand('underline');
-    }
-    if (format.strikeThrough !== undefined) {
-      const isCurrentlyStrike = document.queryCommandState('strikeThrough') || document.queryCommandState('strikethrough');
-      if (!!format.strikeThrough !== isCurrentlyStrike) executeCommand('strikeThrough');
-    }
-    if (format.fontName) {
-      executeCommand('fontName', format.fontName);
-    }
-    if (format.fontSize) {
-      executeCommand('fontSize', format.fontSize);
-    }
-    if (format.foreColor) {
-      executeCommand('foreColor', format.foreColor);
-    }
-    if (format.hiliteColor) {
-      executeCommand('hiliteColor', format.hiliteColor);
-    }
-    if (format.align) {
-      if (format.align === 'center') executeCommand('justifyCenter');
-      else if (format.align === 'right') executeCommand('justifyRight');
-      else if (format.align === 'justify') executeCommand('justifyFull');
-      else executeCommand('justifyLeft');
-    }
-    if (format.formatBlock) {
-      executeCommand('formatBlock', format.formatBlock);
-    }
-    if (format.paragraphBackground) {
-      executeCommand('paragraphBackground', format.paragraphBackground);
-    }
-  };
-
-  const handleContextChange = (ctx: SelectionContext) => {
-    const mergedCtx = pendingStyles ? { ...ctx, ...pendingStyles } : ctx;
-    setSelectionContext(mergedCtx);
-    if (ctx.type === 'image' && editorRef.current) {
-      const img = editorRef.current.getSelectedImage();
-      setSelectedImage(img);
-    } else {
-      setSelectedImage(null);
-    }
-
-    // Paint Format logic!
-    if (isPaintingFormat && copiedFormatting && ctx.type === 'text') {
-      applyFormatting(copiedFormatting);
-      setIsPaintingFormat(false);
-      toast.success('Format applied!');
-    }
-  };
-
-  const handleRestoreVersion = (content: string) => {
-      if (currentDoc) {
-          saveSnapshot(currentDoc);
-          setCurrentDoc({ ...currentDoc, content, lastModified: Date.now() });
-      }
-  };
-
-  const handleApplyCorrection = (original: string, correction: string) => {
-    if (!currentDoc || !editorRef.current) return;
-    const currentContent = editorRef.current.getInnerHtml();
-    const updatedContent = currentContent.replace(original, correction);
-    setCurrentDoc(prev => prev ? { ...prev, content: updatedContent, lastModified: Date.now() } : null);
-  };
-
-  const handleHeaderFooterSave = (data: {
-    header: string;
-    footer: string;
-    showPageNumbers: boolean;
-    pageNumberPosition: 'header-left' | 'header-center' | 'header-right' | 'footer-left' | 'footer-center' | 'footer-right';
-  }) => {
-    if (!currentDoc) return;
-    setCurrentDoc(prev => prev ? {
-      ...prev,
-      header: data.header,
-      footer: data.footer,
-      showPageNumbers: data.showPageNumbers,
-      pageNumberPosition: data.pageNumberPosition,
-      lastModified: Date.now()
-    } : null);
-  };
-
-  const handleOpenLinkDialog = () => {
-    const selection = window.getSelection();
-    if (selection && selection.rangeCount > 0) {
-      const range = selection.getRangeAt(0);
-      const parentElement = range.commonAncestorContainer.parentElement;
-      const linkElement = parentElement?.closest('a');
-      if (linkElement) {
-        setExistingLink({
-          url: linkElement.href,
-          text: linkElement.textContent || ''
-        });
-      } else {
-        setExistingLink(null);
-      }
-    }
-    setShowLinkDialog(true);
-  };
-
-  const handleInsertLink = (url: string, text: string) => {
-    const selection = window.getSelection();
-    if (selection && selection.rangeCount > 0) {
-      const range = selection.getRangeAt(0);
-      const parentElement = range.commonAncestorContainer.parentElement;
-      const linkElement = parentElement?.closest('a');
-
-      if (linkElement) {
-        linkElement.href = url;
-        linkElement.textContent = text;
-      } else {
-        const a = document.createElement('a');
-        a.href = url;
-        a.target = '_blank';
-        a.rel = 'noopener noreferrer';
-        a.textContent = text;
-
-        if (selection.toString()) {
-          range.deleteContents();
-        }
-        range.insertNode(a);
-      }
-
-      if (editorRef.current) {
-        const html = editorRef.current.getInnerHtml();
-        const textContent = editorRef.current.getInnerText();
-        handleContentChange(html, textContent);
-      }
-    }
-  };
-
-  const handleRemoveLink = () => {
-    const selection = window.getSelection();
-    if (selection && selection.rangeCount > 0) {
-      const range = selection.getRangeAt(0);
-      const parentElement = range.commonAncestorContainer.parentElement;
-      const linkElement = parentElement?.closest('a');
-
-      if (linkElement) {
-        const textNode = document.createTextNode(linkElement.textContent || '');
-        linkElement.parentNode?.replaceChild(textNode, linkElement);
-
-        if (editorRef.current) {
-          const html = editorRef.current.getInnerHtml();
-          const textContent = editorRef.current.getInnerText();
-          handleContentChange(html, textContent);
-        }
-      }
-    }
-  };
-
-  const handleInsertEquation = (latex: string) => {
-    const equationSpan = document.createElement('span');
-    equationSpan.className = 'katex-equation';
-    equationSpan.setAttribute('data-latex', latex);
-    equationSpan.style.display = 'inline-block';
-    equationSpan.style.margin = '0 4px';
-
-    try {
-      const katex = require('katex');
-      katex.render(latex, equationSpan, {
-        throwOnError: false,
-        displayMode: false,
-      });
-    } catch (err) {
-      equationSpan.textContent = `[Equation: ${latex}]`;
-    }
-
-    const selection = window.getSelection();
-    if (selection && selection.rangeCount > 0) {
-      const range = selection.getRangeAt(0);
-      range.deleteContents();
-      range.insertNode(equationSpan);
-      range.setStartAfter(equationSpan);
-      range.setEndAfter(equationSpan);
-      selection.removeAllRanges();
-      selection.addRange(range);
-    }
-
-    if (editorRef.current) {
-      const html = editorRef.current.getInnerHtml();
-      const textContent = editorRef.current.getInnerText();
-      handleContentChange(html, textContent);
-    }
-  };
-
-  const handleInsertTOC = (tocHTML: string) => {
-    executeCommand('insertHTML', tocHTML);
-    if (editorRef.current) {
-      const html = editorRef.current.getInnerHtml();
-      const textContent = editorRef.current.getInnerText();
-      handleContentChange(html, textContent);
-    }
-  };
-
-  const handleInsertFootnote = (noteData: { type: 'footnote' | 'endnote'; content: string; number: number }) => {
-    const refSpan = document.createElement('sup');
-    refSpan.className = `${noteData.type}-ref`;
-    refSpan.setAttribute('data-note-id', `${noteData.type}-${noteData.number}`);
-    refSpan.textContent = noteData.number.toString();
-    refSpan.style.color = '#3b82f6';
-    refSpan.style.cursor = 'pointer';
-    refSpan.style.fontWeight = 'bold';
-
-    const selection = window.getSelection();
-    if (selection && selection.rangeCount > 0) {
-      const range = selection.getRangeAt(0);
-      range.deleteContents();
-      range.insertNode(refSpan);
-      range.setStartAfter(refSpan);
-      range.setEndAfter(refSpan);
-      selection.removeAllRanges();
-      selection.addRange(range);
-    }
-
-    if (currentDoc) {
-      const notes = currentDoc.footnotes || [];
-      notes.push(noteData);
-      setCurrentDoc(prev => prev ? { ...prev, footnotes: notes, lastModified: Date.now() } : null);
-    }
-
-    if (editorRef.current) {
-      const html = editorRef.current.getInnerHtml();
-      const textContent = editorRef.current.getInnerText();
-      handleContentChange(html, textContent);
-    }
-  };
-
-  const handleAddCitation = (citation: Citation) => {
-    if (!currentDoc) return;
-    const citations = currentDoc.citations || [];
-    citations.push(citation);
-    setCurrentDoc(prev => prev ? { ...prev, citations, lastModified: Date.now() } : null);
-  };
-
-  const handleDeleteCitation = (citationId: string) => {
-    if (!currentDoc) return;
-    const citations = (currentDoc.citations || []).filter(c => c.id !== citationId);
-    setCurrentDoc(prev => prev ? { ...prev, citations, lastModified: Date.now() } : null);
-  };
-
-  const handleInsertCitation = (citationId: string, style: 'apa' | 'mla' | 'chicago' | 'bibtex') => {
-    const citation = currentDoc?.citations?.find(c => c.id === citationId);
-    if (!citation) return;
-
-    let citationText = '';
-    const { author, year } = citation;
-
-    switch (style) {
-      case 'apa':
-        citationText = `(${author}, ${year})`;
-        break;
-      case 'mla':
-        citationText = `(${author})`;
-        break;
-      case 'chicago':
-        citationText = `(${author} ${year})`;
-        break;
-      case 'bibtex':
-        citationText = `\\cite{${author.split(' ')[0].toLowerCase()}${year}}`;
-        break;
-    }
-
-    executeCommand('insertHTML', `<span class="citation" data-citation-id="${citationId}">${citationText}</span>`);
-
-    if (editorRef.current) {
-      const html = editorRef.current.getInnerHtml();
-      const textContent = editorRef.current.getInnerText();
-      handleContentChange(html, textContent);
-    }
-  };
-
-  const handleInsertBibliography = (style: 'apa' | 'mla' | 'chicago' | 'bibtex') => {
-    const citations = currentDoc?.citations || [];
-    if (citations.length === 0) return;
-
-    let bibliographyHTML = '<div class="bibliography" style="margin-top: 40px; page-break-before: always;">';
-    const titleMap = { apa: 'References', mla: 'Works Cited', chicago: 'Bibliography', bibtex: 'References' };
-    bibliographyHTML += `<h2 style="font-size: 1.5em; font-weight: bold; margin-bottom: 20px;">${titleMap[style]}</h2>`;
-    bibliographyHTML += '<div style="padding-left: 40px; text-indent: -40px;">';
-
-    citations.forEach(citation => {
-      const { author, title, year, publisher, journal, volume, pages } = citation;
-      let entry = '';
-
-      switch (style) {
-        case 'apa':
-          if (citation.type === 'book') {
-            entry = `${author} (${year}). <i>${title}</i>. ${publisher || 'Publisher'}.`;
-          } else if (citation.type === 'journal') {
-            entry = `${author} (${year}). ${title}. <i>${journal}</i>, ${volume}${pages ? `, ${pages}` : ''}.`;
-          } else {
-            entry = `${author} (${year}). ${title}.`;
-          }
-          break;
-        case 'mla':
-          if (citation.type === 'book') {
-            entry = `${author}. <i>${title}</i>. ${publisher || 'Publisher'}, ${year}.`;
-          } else if (citation.type === 'journal') {
-            entry = `${author}. "${title}." <i>${journal}</i> ${volume} (${year})${pages ? `: ${pages}` : ''}.`;
-          } else {
-            entry = `${author}. <i>${title}</i>. ${year}.`;
-          }
-          break;
-        case 'chicago':
-          if (citation.type === 'book') {
-            entry = `${author}. <i>${title}</i>. ${publisher ? `${publisher}, ` : ''}${year}.`;
-          } else if (citation.type === 'journal') {
-            entry = `${author}. "${title}." <i>${journal}</i> ${volume}${pages ? ` (${year}): ${pages}` : ` (${year})`}.`;
-          } else {
-            entry = `${author}. <i>${title}</i>. ${year}.`;
-          }
-          break;
-        case 'bibtex':
-          const bibType = citation.type === 'journal' ? 'article' : citation.type;
-          entry = `<pre style="font-family: monospace; margin: 10px 0;">@${bibType}{${author.split(' ')[0].toLowerCase()}${year},
-  author = {${author}},
-  title = {${title}},
-  year = {${year}}
-}</pre>`;
-          break;
-      }
-      bibliographyHTML += `<p style="margin: 8px 0;">${entry}</p>`;
-    });
-
-    bibliographyHTML += '</div></div>';
-    executeCommand('insertHTML', bibliographyHTML);
-
-    if (editorRef.current) {
-      const html = editorRef.current.getInnerHtml();
-      const textContent = editorRef.current.getInnerText();
-      handleContentChange(html, textContent);
-    }
-  };
-
-  const handleInsertCodeBlock = (code: string, language: string, theme: string) => {
-    if (editorRef.current) editorRef.current.focus();
-
-    const escapedCode = code
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
-
-    const lines = code.split('\n');
-    const lineNumbersHTML = lines.map((_, i) => `<div style="line-height: 1.6; font-size: 14px;">${i + 1}</div>`).join('');
-
-    const codeBlockHTML = `
-      <div class="code-block-container" style="margin: 20px 0; border-radius: 8px; overflow: hidden; background: #2d2d2d; font-family: 'Courier New', monospace;">
-        <div class="code-block-header" style="background: #1e1e1e; padding: 8px 16px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #404040;">
-          <span style="color: #888; font-size: 12px; text-transform: uppercase;">${language}</span>
-          <button onclick="navigator.clipboard.writeText(this.parentElement.nextElementSibling.querySelector('code').textContent); alert('Copied!');" style="background: #404040; color: #fff; border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 11px;">Copy</button>
-        </div>
-        <div class="code-block-content" style="display: flex; overflow-x: auto;">
-          <div class="line-numbers" style="background: #1e1e1e; padding: 12px 8px; text-align: right; color: #6e7681; user-select: none; min-width: 40px; border-right: 1px solid #404040; font-family: 'Courier New', monospace;">
-            ${lineNumbersHTML}
-          </div>
-          <pre style="margin: 0; padding: 12px 16px; flex: 1; overflow-x: auto;"><code class="language-${language}" style="color: #d4d4d4; font-size: 14px; line-height: 1.6; white-space: pre; display: block;">${escapedCode}</code></pre>
-        </div>
-      </div>
-    `;
-
-    document.execCommand('insertHTML', false, codeBlockHTML);
-
-    if (editorRef.current) {
-      const html = editorRef.current.getInnerHtml();
-      const textContent = editorRef.current.getInnerText();
-      handleContentChange(html, textContent);
-    }
-  };
-
-  const handleAddComment = (text: string, rangeId: string) => {
-    if (!currentDoc) return;
-    const newComment: Comment = {
-      id: crypto.randomUUID(),
-      rangeId,
-      author: currentUser,
-      text,
-      timestamp: Date.now(),
-      resolved: false,
-      replies: []
-    };
-    const updatedComments = [...(currentDoc.comments || []), newComment];
-    setCurrentDoc(prev => prev ? { ...prev, comments: updatedComments, lastModified: Date.now() } : null);
-  };
-
-  const handleReplyToComment = (commentId: string, text: string) => {
-    if (!currentDoc) return;
-    const reply: CommentReply = {
-      id: crypto.randomUUID(),
-      author: currentUser,
-      text,
-      timestamp: Date.now()
-    };
-    const updatedComments = currentDoc.comments?.map(comment =>
-      comment.id === commentId ? { ...comment, replies: [...comment.replies, reply] } : comment
-    );
-    setCurrentDoc(prev => prev ? { ...prev, comments: updatedComments, lastModified: Date.now() } : null);
-  };
-
-  const handleResolveComment = (commentId: string) => {
-    if (!currentDoc) return;
-    const updatedComments = currentDoc.comments?.map(comment =>
-      comment.id === commentId ? { ...comment, resolved: true } : comment
-    );
-    setCurrentDoc(prev => prev ? { ...prev, comments: updatedComments, lastModified: Date.now() } : null);
-  };
-
-  const handleDeleteComment = (commentId: string) => {
-    if (!currentDoc) return;
-    const updatedComments = currentDoc.comments?.filter(comment => comment.id !== commentId);
-    setCurrentDoc(prev => prev ? { ...prev, comments: updatedComments, lastModified: Date.now() } : null);
-  };
-
-  const handleHighlightComment = (commentId: string) => {
-    const commentElement = document.querySelector(`[data-comment-id="${commentId}"]`);
-    if (commentElement) {
-      commentElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      commentElement.classList.add('comment-flash');
-      setTimeout(() => commentElement.classList.remove('comment-flash'), 1000);
-    }
-  };
-
-  const handleCreateCommentFromSelection = () => {
-    const selection = window.getSelection();
-    if (!selection || selection.isCollapsed) {
-      alert('Please select some text to comment on');
-      return;
-    }
-
-    const range = selection.getRangeAt(0);
-    const rangeId = crypto.randomUUID();
-    const span = document.createElement('span');
-    span.className = 'comment-highlight';
-    span.setAttribute('data-comment-id', rangeId);
-    span.style.cssText = 'background-color: rgba(255, 193, 7, 0.3); cursor: pointer;';
-
-    try {
-      range.surroundContents(span);
-    } catch (e) {
-      const fragment = range.extractContents();
-      span.appendChild(fragment);
-      range.insertNode(span);
-    }
-
-    selection.removeAllRanges();
-    const text = prompt('Enter your comment:');
-    if (text) {
-      handleAddComment(text, rangeId);
-      setShowCommentsPanel(true);
-    } else {
-      span.replaceWith(...span.childNodes);
-    }
-
-    if (editorRef.current) {
-      const html = editorRef.current.getInnerHtml();
-      const textContent = editorRef.current.getInnerText();
-      handleContentChange(html, textContent);
-    }
-  };
-
-  const handleToggleTracking = () => {
-    if (!currentDoc) return;
-    setCurrentDoc(prev => prev ? {
-      ...prev,
-      trackingEnabled: !prev.trackingEnabled,
-      lastModified: Date.now()
-    } : null);
-  };
-
-  const handleToggleScreenplay = () => {
-    if (!currentDoc) return;
-    setCurrentDoc(prev => prev ? {
-      ...prev,
-      isScreenplay: !prev.isScreenplay,
-      lastModified: Date.now()
-    } : null);
-  };
-
-  const handleToggleMarkdown = () => {
-    if (!currentDoc) return;
-    setCurrentDoc(prev => prev ? {
-      ...prev,
-      isMarkdownMode: !prev.isMarkdownMode,
-      lastModified: Date.now()
-    } : null);
-  };
-
-  const handleAcceptChange = (changeId: string) => {
-    if (!currentDoc) return;
-    const change = currentDoc.trackChanges?.find(c => c.id === changeId);
-    if (!change) return;
-
-    if (change.type === 'insert') {
-      const updatedChanges = currentDoc.trackChanges?.map(c =>
-        c.id === changeId ? { ...c, accepted: true } : c
-      );
-      setCurrentDoc(prev => prev ? { ...prev, trackChanges: updatedChanges, lastModified: Date.now() } : null);
-
-      const changeElement = document.querySelector(`[data-change-id="${changeId}"]`);
-      if (changeElement) {
-        const textContent = changeElement.textContent;
-        const textNode = document.createTextNode(textContent || '');
-        changeElement.parentNode?.replaceChild(textNode, changeElement);
-      }
-    } else if (change.type === 'delete') {
-      const changeElement = document.querySelector(`[data-change-id="${changeId}"]`);
-      if (changeElement) {
-        changeElement.remove();
-      }
-
-      const updatedChanges = currentDoc.trackChanges?.map(c =>
-        c.id === changeId ? { ...c, accepted: true } : c
-      );
-      setCurrentDoc(prev => prev ? { ...prev, trackChanges: updatedChanges, lastModified: Date.now() } : null);
-    }
-
-    if (editorRef.current) {
-      const html = editorRef.current.getInnerHtml();
-      const textContent = editorRef.current.getInnerText();
-      handleContentChange(html, textContent);
-    }
-  };
-
-  const handleRejectChange = (changeId: string) => {
-    if (!currentDoc) return;
-    const change = currentDoc.trackChanges?.find(c => c.id === changeId);
-    if (!change) return;
-
-    if (change.type === 'insert') {
-      const changeElement = document.querySelector(`[data-change-id="${changeId}"]`);
-      if (changeElement) changeElement.remove();
-    } else if (change.type === 'delete') {
-      const changeElement = document.querySelector(`[data-change-id="${changeId}"]`);
-      if (changeElement && change.oldContent) {
-        const textNode = document.createTextNode(change.oldContent);
-        changeElement.parentNode?.replaceChild(textNode, changeElement);
-      }
-    }
-
-    const updatedChanges = currentDoc.trackChanges?.map(c =>
-      c.id === changeId ? { ...c, rejected: true } : c
-    );
-    setCurrentDoc(prev => prev ? { ...prev, trackChanges: updatedChanges, lastModified: Date.now() } : null);
-
-    if (editorRef.current) {
-      const html = editorRef.current.getInnerHtml();
-      const textContent = editorRef.current.getInnerText();
-      handleContentChange(html, textContent);
-    }
-  };
-
-  const handleAcceptAllChanges = () => {
-    if (!currentDoc) return;
-    currentDoc.trackChanges?.forEach(change => {
-      if (!change.accepted && !change.rejected) {
-        handleAcceptChange(change.id);
-      }
-    });
-  };
-
-  const handleRejectAllChanges = () => {
-    if (!currentDoc) return;
-    currentDoc.trackChanges?.forEach(change => {
-      if (!change.accepted && !change.rejected) {
-        handleRejectChange(change.id);
-      }
-    });
-  };
-
-  const handleHighlightChange = (changeId: string) => {
-    const changeElement = document.querySelector(`[data-change-id="${changeId}"]`);
-    if (changeElement) {
-      changeElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      changeElement.classList.add('change-flash');
-      setTimeout(() => changeElement.classList.remove('change-flash'), 1000);
-    }
-  };
-
-  const contextValue: AppContextType = {
-    documents, setDocuments,
-    currentDoc, setCurrentDoc,
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [flushPendingEdits, handleOpenLinkDialog]);
+  const handleSaveNowRef = useRef(handleSaveNow);
+  handleSaveNowRef.current = handleSaveNow;
+
+  /* ------------------------------ value ----------------------------- */
+
+  const registerEditorFlush = useCallback((fn: (() => void) | null) => {
+    editorFlushRef.current = fn;
+  }, []);
+
+  const setActiveEditor = useCallback((ed: Editor | null) => setEditor(ed), []);
+
+  const value: AppContextType = {
+    documents,
+    currentDoc,
+    docsLoaded: docState.loaded,
+    contentRevision: currentDoc ? docState.revs[currentDoc.id] || 0 : 0,
+    updateCurrentDoc,
+    flushPendingEdits,
+    editor,
+    setActiveEditor,
+    registerEditorFlush,
+    stats,
+    setStats,
+    pageInfo,
+    setPageInfo,
+    wordCount: stats.words,
+    rawText: stats.text,
+    selectedImage,
+    setSelectedImage,
+    collabSession,
+    setCollabSession,
     isSidebarOpen, setIsSidebarOpen,
     zoom, setZoom,
     showRuler, setShowRuler,
@@ -1235,6 +573,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     showOutline, setShowOutline,
     showDiagramEditor, setShowDiagramEditor,
     showHeaderFooter, setShowHeaderFooter,
+    headerFooterSectionPos,
+    openHeaderFooter,
     showLinkDialog, setShowLinkDialog,
     existingLink, setExistingLink,
     showCommentsPanel, setShowCommentsPanel,
@@ -1242,41 +582,46 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     showImportDialog, setShowImportDialog,
     showCollaborationDialog, setShowCollaborationDialog,
     showEquationDialog, setShowEquationDialog,
+    editingEquation, setEditingEquation,
     showTOCDialog, setShowTOCDialog,
     showFootnoteDialog, setShowFootnoteDialog,
+    editingFootnote, setEditingFootnote,
     showCitationDialog, setShowCitationDialog,
     showCodeBlockDialog, setShowCodeBlockDialog,
     showImageGallery, setShowImageGallery,
     showKeyboardShortcuts, setShowKeyboardShortcuts,
-    selectedImage, setSelectedImage,
+    stylesDialog, setStylesDialog,
+    showFocusMode, setShowFocusMode,
+    pendingCommentId, setPendingCommentId,
     currentUser, setCurrentUser,
     darkMode, setDarkMode,
-    wordCount, setWordCount,
-    rawText, setRawText,
-    zenMode, setZenMode,
     pasteAsPlainText, setPasteAsPlainText,
     uiLanguage, setUiLanguage,
     isRibbonCollapsed, setIsRibbonCollapsed,
-    showFocusMode, setShowFocusMode,
     typewriterMode, setTypewriterMode,
     wordGoal, setWordGoal,
-    selectionContext, setSelectionContext,
-    editorRef, isMobile, toast,
-
+    isMobile,
+    toast,
     handleNewDoc,
-    handleRemoveFromHistory,
+    handleCreateDocument,
+    handleRemoveFromHistory: handleDeleteDocument,
+    handleDeleteDocument,
     handleTemplateSelect,
     handleImportDocument,
     handleOpenDoc,
+    handleReplaceDocument,
     handleContentChange,
     handleTitleChange,
     handlePageConfigChange,
     handleLanguageChange,
+    handleSaveNow,
     executeCommand,
     handleTableAction,
     handleImageAction,
+    updateSelectedImage,
+    deleteSelectedImage,
     handleReplaceImage,
-    handleContextChange,
+    handleInsertImageFiles,
     handleRestoreVersion,
     handleApplyCorrection,
     handleHeaderFooterSave,
@@ -1286,17 +631,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     handleInsertEquation,
     handleInsertTOC,
     handleInsertFootnote,
+    handleUpdateFootnote,
     handleAddCitation,
+    handleUpdateCitation,
     handleDeleteCitation,
     handleInsertCitation,
     handleInsertBibliography,
     handleInsertCodeBlock,
+    handleInsertDiagram,
+    handleInsertPageBreak,
+    handleSectionSettingsSave,
     handleAddComment,
     handleReplyToComment,
     handleResolveComment,
+    handleReopenComment,
     handleDeleteComment,
     handleHighlightComment,
     handleCreateCommentFromSelection,
+    handleCancelPendingComment,
     handleToggleTracking,
     handleToggleScreenplay,
     handleToggleMarkdown,
@@ -1305,9 +657,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     handleAcceptAllChanges,
     handleRejectAllChanges,
     handleHighlightChange,
-    copiedFormatting, setCopiedFormatting,
-    isPaintingFormat, setIsPaintingFormat
+    copiedFormatting,
+    setCopiedFormatting,
+    isPaintingFormat,
+    setIsPaintingFormat,
+    startPaintFormat,
+    applyPaintFormat,
   };
 
-  return <AppContext.Provider value={contextValue}>{children}</AppContext.Provider>;
+
+  return (
+    <AppContext.Provider value={value}>
+      <SelectionSetterCtx.Provider value={setSelectionContext}>
+        <SelectionCtx.Provider value={selectionContext}>{children}</SelectionCtx.Provider>
+      </SelectionSetterCtx.Provider>
+    </AppContext.Provider>
+  );
 };

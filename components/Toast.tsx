@@ -1,5 +1,7 @@
 import React, { useEffect } from 'react';
 import { CheckCircle, XCircle, Info, AlertTriangle, X } from 'lucide-react';
+import { useApp } from '../AppContext';
+import { t } from '../utils/translations';
 
 export type ToastType = 'success' | 'error' | 'info' | 'warning';
 
@@ -17,6 +19,7 @@ interface ToastProps {
 }
 
 const Toast: React.FC<ToastProps> = ({ toast, onClose, darkMode }) => {
+  const { uiLanguage } = useApp();
   useEffect(() => {
     const duration = toast.duration || 3000;
     const timer = setTimeout(() => {
@@ -79,7 +82,7 @@ const Toast: React.FC<ToastProps> = ({ toast, onClose, darkMode }) => {
         className={`flex-shrink-0 p-1 rounded-lg transition-colors ${
           darkMode ? 'hover:bg-white/10' : 'hover:bg-black/10'
         }`}
-        aria-label="Close notification"
+        aria-label={t(uiLanguage, 'closeNotification')}
       >
         <X size={16} />
       </button>
@@ -94,14 +97,27 @@ interface ToastContainerProps {
 }
 
 export const ToastContainer: React.FC<ToastContainerProps> = ({ toasts, onClose, darkMode }) => {
+  // Screen readers: errors are announced immediately (assertive), everything
+  // else politely. The live regions are always present (visually hidden) so
+  // additions are reliably announced; the visible stack is unchanged.
+  const errors = toasts.filter(toast => toast.type === 'error');
+  const others = toasts.filter(toast => toast.type !== 'error');
   return (
-    <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 pointer-events-none">
-      <div className="flex flex-col gap-2 pointer-events-auto">
-        {toasts.map((toast) => (
-          <Toast key={toast.id} toast={toast} onClose={onClose} darkMode={darkMode} />
-        ))}
+    <>
+      <div className="sr-only" role="alert" aria-live="assertive" aria-atomic="false">
+        {errors.map(toast => <p key={toast.id}>{toast.message}</p>)}
       </div>
-    </div>
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="false">
+        {others.map(toast => <p key={toast.id}>{toast.message}</p>)}
+      </div>
+      <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 pointer-events-none">
+        <div className="flex flex-col gap-2 pointer-events-auto">
+          {toasts.map((toast) => (
+            <Toast key={toast.id} toast={toast} onClose={onClose} darkMode={darkMode} />
+          ))}
+        </div>
+      </div>
+    </>
   );
 };
 

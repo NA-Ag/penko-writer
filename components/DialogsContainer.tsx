@@ -1,30 +1,61 @@
-import React from 'react';
+import React, { useMemo, useEffect, useRef } from 'react';
 import { useApp } from '../AppContext';
-import { AdvancedFindReplace } from './AdvancedFindReplace';
-import { SpellChecker } from './SpellChecker';
-import { StatsDialog } from './StatsDialog';
-import { HistoryDialog } from './HistoryDialog';
-import { DocumentOutline } from './DocumentOutline';
-import { DiagramEditor } from './DiagramEditor';
-import { TemplateDialog } from './TemplateDialog';
-import ImportDialog from './ImportDialog';
-import { SettingsDialog } from './SettingsDialog';
-import { PresentationView } from './PresentationView';
-import { HeaderFooterDialog } from './HeaderFooterDialog';
-import { LinkDialog } from './LinkDialog';
-import CollaborationDialog from './CollaborationDialog';
-import EquationDialog from './EquationDialog';
-import TableOfContentsDialog from './TableOfContentsDialog';
-import FootnoteDialog from './FootnoteDialog';
-import CitationDialog from './CitationDialog';
-import CodeBlockDialog from './CodeBlockDialog';
-import { CommentsPanel } from './CommentsPanel';
-import { ImageToolbar } from './ImageToolbar';
-import { ImageGallery } from './ImageGallery';
+import { lazyDialog, always } from './lazyDialog';
+import { CommentsPanel, ResolvedCommentStyles } from './CommentsPanel';
 import InstallPrompt from './InstallPrompt';
-import KeyboardShortcutsDialog from './KeyboardShortcutsDialog';
 import { ToastContainer } from './Toast';
-import { FocusMode } from './FocusMode';
+import { DocumentStyleSheet } from './DocumentStyleSheet';
+import { t } from '../utils/translations';
+import { SyncManager } from './SyncManager';
+import { setSyncDialogOpen, useSyncDialogOpen } from '../utils/sync/status';
+import { sectionBreaks, resolveSection } from '../editor/extensions/sections';
+import { prepareHtmlForEditor } from '../editor/sanitize';
+import type { SectionEditState } from './HeaderFooterDialog';
+
+// Dialogs/panels are code-split: each chunk is fetched the first time it opens.
+const AdvancedFindReplace = lazyDialog(() => import('./AdvancedFindReplace').then((m) => m.AdvancedFindReplace));
+const SpellChecker = lazyDialog(() => import('./SpellChecker').then((m) => m.SpellChecker));
+const StatsDialog = lazyDialog(() => import('./StatsDialog').then((m) => m.StatsDialog));
+const HistoryDialog = lazyDialog(() => import('./HistoryDialog').then((m) => m.HistoryDialog));
+const DocumentOutline = lazyDialog(() => import('./DocumentOutline').then((m) => m.DocumentOutline));
+const DiagramEditor = lazyDialog(() => import('./DiagramEditor').then((m) => m.DiagramEditor));
+const TemplateDialog = lazyDialog(() => import('./TemplateDialog').then((m) => m.TemplateDialog));
+const ImportDialog = lazyDialog(() => import('./ImportDialog').then((m) => m.default));
+const SettingsDialog = lazyDialog(() => import('./SettingsDialog').then((m) => m.SettingsDialog));
+const PresentationView = lazyDialog(() => import('./PresentationView').then((m) => m.PresentationView), always);
+const HeaderFooterDialog = lazyDialog(() => import('./HeaderFooterDialog').then((m) => m.HeaderFooterDialog));
+const LinkDialog = lazyDialog(() => import('./LinkDialog').then((m) => m.LinkDialog));
+const CollaborationDialog = lazyDialog(() => import('./CollaborationDialog').then((m) => m.default));
+const EquationDialog = lazyDialog(() => import('./EquationDialog').then((m) => m.default));
+const TableOfContentsDialog = lazyDialog(() => import('./TableOfContentsDialog').then((m) => m.default));
+const FootnoteDialog = lazyDialog(() => import('./FootnoteDialog').then((m) => m.default));
+const CitationDialog = lazyDialog(() => import('./CitationDialog').then((m) => m.default));
+const CodeBlockDialog = lazyDialog(() => import('./CodeBlockDialog').then((m) => m.default));
+const TrackChangesPanel = lazyDialog(() => import('./TrackChangesPanel').then((m) => m.TrackChangesPanel));
+const ImageToolbar = lazyDialog(() => import('./ImageToolbar').then((m) => m.ImageToolbar), always);
+const ImageGallery = lazyDialog(() => import('./ImageGallery').then((m) => m.ImageGallery), always);
+const KeyboardShortcutsDialog = lazyDialog(() => import('./KeyboardShortcutsDialog').then((m) => m.default));
+const FocusMode = lazyDialog(() => import('./FocusMode').then((m) => m.FocusMode), always);
+const SyncDialog = lazyDialog(() => import('./SyncDialog').then((m) => m.SyncDialog));
+const StylesDialog = lazyDialog(() => import('./StylesDialog').then((m) => m.StylesDialog), (p) => !!p.request);
+
+/**
+ * The comments, track-changes and outline panels occupy the same spot on the
+ * right: opening one closes the others (otherwise it would open hidden
+ * underneath a panel that is already open).
+ */
+const useExclusiveRightPanels = (open: boolean[], setters: ((open: boolean) => void)[]) => {
+  const prev = useRef(open);
+  useEffect(() => {
+    const opened = open.findIndex((isOpen, i) => isOpen && !prev.current[i]);
+    prev.current = open;
+    if (opened === -1) return;
+    open.forEach((isOpen, i) => {
+      if (isOpen && i !== opened) setters[i](false);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, open);
+};
 
 export const DialogsContainer: React.FC = () => {
   const {
@@ -41,7 +72,7 @@ export const DialogsContainer: React.FC = () => {
     showLinkDialog, setShowLinkDialog,
     existingLink,
     showCommentsPanel, setShowCommentsPanel,
-    showTrackChangesPanel,
+    showTrackChangesPanel, setShowTrackChangesPanel,
     showImportDialog, setShowImportDialog,
     showCollaborationDialog, setShowCollaborationDialog,
     showEquationDialog, setShowEquationDialog,
@@ -51,25 +82,23 @@ export const DialogsContainer: React.FC = () => {
     showCodeBlockDialog, setShowCodeBlockDialog,
     showImageGallery, setShowImageGallery,
     showKeyboardShortcuts, setShowKeyboardShortcuts,
-    selectedImage, setSelectedImage,
+    stylesDialog, setStylesDialog,
+    selectedImage,
     currentUser,
     darkMode,
-    rawText,
+    stats,
     pasteAsPlainText, setPasteAsPlainText,
     showRuler, setShowRuler,
     uiLanguage, setUiLanguage,
     currentDoc,
-    editorRef,
     toast,
     showFocusMode, setShowFocusMode,
     typewriterMode, setTypewriterMode,
     wordGoal, setWordGoal,
 
-    handleContentChange,
     handleApplyCorrection,
     handleRestoreVersion,
     handleTemplateSelect,
-    handleImportDocument,
     handleHeaderFooterSave,
     handleInsertLink,
     handleRemoveLink,
@@ -81,35 +110,104 @@ export const DialogsContainer: React.FC = () => {
     handleAddCitation,
     handleDeleteCitation,
     handleInsertCodeBlock,
+    handleInsertDiagram,
     handleAddComment,
     handleReplyToComment,
     handleResolveComment,
+    handleReopenComment,
     handleDeleteComment,
     handleHighlightComment,
-    handleImageAction
+    pendingCommentId,
+    handleCancelPendingComment,
+    handleToggleTracking,
+    handleAcceptChange,
+    handleRejectChange,
+    handleAcceptAllChanges,
+    handleRejectAllChanges,
+    handleHighlightChange,
+    headerFooterSectionPos,
+    handleSectionSettingsSave,
+    editor,
   } = useApp();
+
+  // Header/footer dialog edits either the document (first section) or a later section's break node
+  const headerFooterProps = useMemo(() => {
+    const docProps = {
+      headerContent: currentDoc?.header || '',
+      footerContent: currentDoc?.footer || '',
+      showPageNumbers: currentDoc?.showPageNumbers || false,
+      pageNumberPosition: currentDoc?.pageNumberPosition || ('footer-center' as const),
+      differentFirstPage: currentDoc?.differentFirstPage || false,
+      pageNumberFormat: currentDoc?.pageNumberFormat || ('decimal' as const),
+      onSave: handleHeaderFooterSave,
+    };
+    if (!showHeaderFooter || headerFooterSectionPos === null || !editor || editor.isDestroyed || !currentDoc) return docProps;
+    const breaks = sectionBreaks(editor.state.doc);
+    const index = breaks.findIndex(b => b.pos === headerFooterSectionPos) + 1;
+    if (index < 1) return docProps;
+    const own = breaks[index - 1].settings;
+    const inherited = resolveSection(currentDoc, breaks.map(b => b.settings), index - 1);
+    const pos = headerFooterSectionPos;
+    return {
+      headerContent: own.header ?? inherited.header,
+      footerContent: own.footer ?? inherited.footer,
+      showPageNumbers: own.showPageNumbers ?? inherited.showPageNumbers,
+      pageNumberPosition: own.pageNumberPosition || inherited.pageNumberPosition,
+      differentFirstPage: own.differentFirstPage,
+      pageNumberFormat: own.pageNumberFormat || inherited.pageNumberFormat,
+      section: { index, linkHeader: own.header === null, linkFooter: own.footer === null, restartNumbering: own.restartNumbering, startAt: own.startAt },
+      onSave: (data: Parameters<typeof handleHeaderFooterSave>[0] & { section?: SectionEditState }) =>
+        handleSectionSettingsSave(pos, {
+          header: data.section?.linkHeader ? null : prepareHtmlForEditor(data.header),
+          footer: data.section?.linkFooter ? null : prepareHtmlForEditor(data.footer),
+          showPageNumbers: data.showPageNumbers,
+          pageNumberPosition: data.pageNumberPosition,
+          pageNumberFormat: data.pageNumberFormat,
+          differentFirstPage: !!data.differentFirstPage,
+          restartNumbering: !!data.section?.restartNumbering,
+          startAt: data.section?.startAt ?? 1,
+          orientation: own.orientation,
+        }),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showHeaderFooter, headerFooterSectionPos, currentDoc?.header, currentDoc?.footer, currentDoc?.showPageNumbers, currentDoc?.pageNumberPosition, currentDoc?.differentFirstPage, currentDoc?.pageNumberFormat, editor]);
+
+  const showSync = useSyncDialogOpen();
+
+  useExclusiveRightPanels(
+    [showCommentsPanel, showTrackChangesPanel, showOutline],
+    [
+      (open: boolean) => {
+        // closing the comments panel mid-composition drops the pending highlight
+        if (!open && pendingCommentId) handleCancelPendingComment();
+        setShowCommentsPanel(open);
+      },
+      setShowTrackChangesPanel,
+      setShowOutline,
+    ],
+  );
 
   return (
     <>
-      <AdvancedFindReplace isOpen={showSearch} onClose={() => setShowSearch(false)} darkMode={darkMode} uiLanguage={uiLanguage} editorRef={editorRef} />
+      <DocumentStyleSheet />
+      <StylesDialog request={stylesDialog} onClose={() => setStylesDialog(null)} darkMode={darkMode} uiLanguage={uiLanguage} />
+      <AdvancedFindReplace isOpen={showSearch} onClose={() => setShowSearch(false)} darkMode={darkMode} uiLanguage={uiLanguage} />
       <SpellChecker
         isOpen={showSpellCheck}
         onClose={() => setShowSpellCheck(false)}
         darkMode={darkMode}
         uiLanguage={uiLanguage}
-        content={currentDoc?.content || ''}
         documentLanguage={currentDoc?.language || 'en-US'}
         onApplyCorrection={handleApplyCorrection}
       />
-      <StatsDialog isOpen={showStats} onClose={() => setShowStats(false)} text={rawText} darkMode={darkMode} uiLanguage={uiLanguage} />
+      <StatsDialog isOpen={showStats} onClose={() => setShowStats(false)} text={showStats ? stats.text : ''} words={stats.words} darkMode={darkMode} uiLanguage={uiLanguage} />
       <HistoryDialog isOpen={showHistory} onClose={() => setShowHistory(false)} docId={currentDoc?.id || ''} onRestore={handleRestoreVersion} darkMode={darkMode} uiLanguage={uiLanguage} currentContent={currentDoc?.content || ''} />
-      <DocumentOutline isOpen={showOutline} onClose={() => setShowOutline(false)} darkMode={darkMode} uiLanguage={uiLanguage} editorRef={editorRef} />
-      <DiagramEditor isOpen={showDiagramEditor} onClose={() => setShowDiagramEditor(false)} darkMode={darkMode} uiLanguage={uiLanguage} />
+      <DocumentOutline isOpen={showOutline} onClose={() => setShowOutline(false)} darkMode={darkMode} uiLanguage={uiLanguage} />
+      <DiagramEditor isOpen={showDiagramEditor} onClose={() => setShowDiagramEditor(false)} onInsert={(dataUrl) => handleInsertDiagram(dataUrl, t(uiLanguage, 'diagram'))} darkMode={darkMode} uiLanguage={uiLanguage} />
       <TemplateDialog isOpen={showTemplates} onClose={() => setShowTemplates(false)} onSelect={handleTemplateSelect} darkMode={darkMode} uiLanguage={uiLanguage} />
       <ImportDialog
         isOpen={showImportDialog}
         onClose={() => setShowImportDialog(false)}
-        onImport={handleImportDocument}
         darkMode={darkMode}
         uiLanguage={uiLanguage}
       />
@@ -128,18 +226,13 @@ export const DialogsContainer: React.FC = () => {
           <PresentationView
              content={currentDoc.content}
              onClose={() => setShowPresentation(false)}
-             darkMode={darkMode}
           />
       )}
       <HeaderFooterDialog
         isOpen={showHeaderFooter}
         onClose={() => setShowHeaderFooter(false)}
         darkMode={darkMode}
-        headerContent={currentDoc?.header || ''}
-        footerContent={currentDoc?.footer || ''}
-        showPageNumbers={currentDoc?.showPageNumbers || false}
-        pageNumberPosition={currentDoc?.pageNumberPosition || 'footer-center'}
-        onSave={handleHeaderFooterSave}
+        {...headerFooterProps}
       />
       <LinkDialog
         isOpen={showLinkDialog}
@@ -152,9 +245,6 @@ export const DialogsContainer: React.FC = () => {
       <CollaborationDialog
         isOpen={showCollaborationDialog}
         onClose={() => setShowCollaborationDialog(false)}
-        currentContent={currentDoc?.content || ''}
-        onContentChange={handleContentChange}
-        userName={currentUser}
         darkMode={darkMode}
         uiLanguage={uiLanguage}
       />
@@ -170,7 +260,6 @@ export const DialogsContainer: React.FC = () => {
         onClose={() => setShowTOCDialog(false)}
         onInsert={handleInsertTOC}
         darkMode={darkMode}
-        currentContent={currentDoc?.content || ''}
         uiLanguage={uiLanguage}
       />
       <FootnoteDialog
@@ -178,7 +267,6 @@ export const DialogsContainer: React.FC = () => {
         onClose={() => setShowFootnoteDialog(false)}
         onInsert={handleInsertFootnote}
         darkMode={darkMode}
-        existingNotes={currentDoc?.footnotes || []}
         uiLanguage={uiLanguage}
       />
       <CitationDialog
@@ -208,71 +296,33 @@ export const DialogsContainer: React.FC = () => {
         onAddComment={handleAddComment}
         onReplyToComment={handleReplyToComment}
         onResolveComment={handleResolveComment}
+        onReopenComment={handleReopenComment}
         onDeleteComment={handleDeleteComment}
         onHighlightComment={handleHighlightComment}
+        pendingCommentId={pendingCommentId}
+        onCancelPendingComment={handleCancelPendingComment}
+        uiLanguage={uiLanguage}
+      />
+      <ResolvedCommentStyles comments={currentDoc?.comments || []} darkMode={darkMode} />
+      <TrackChangesPanel
+        isOpen={showTrackChangesPanel}
+        onClose={() => setShowTrackChangesPanel(false)}
+        darkMode={darkMode}
+        uiLanguage={uiLanguage}
+        onAcceptChange={handleAcceptChange}
+        onRejectChange={handleRejectChange}
+        onAcceptAll={handleAcceptAllChanges}
+        onRejectAll={handleRejectAllChanges}
+        onHighlightChange={handleHighlightChange}
+        trackingEnabled={!!currentDoc?.trackingEnabled}
+        onToggleTracking={handleToggleTracking}
       />
 
       {/* Image Toolbar - shows when image selected */}
-      {selectedImage && (
-        <ImageToolbar
-          image={selectedImage}
-          onPositionChange={(mode) => {
-            import('../utils/imageUtils').then(({ applyImagePosition }) => {
-              applyImagePosition(selectedImage, mode);
-            });
-          }}
-          onResize={(percent) => editorRef.current?.resizeImage(percent)}
-          onRotate={(degrees) => {
-            import('../utils/imageUtils').then(({ rotateImage }) => {
-              rotateImage(selectedImage, degrees);
-            });
-          }}
-          onEffect={(effect, value) => {
-            import('../utils/imageUtils').then(({ applyImageEffect }) => {
-              applyImageEffect(selectedImage, effect, value);
-            });
-          }}
-          onAltText={() => {
-            const currentAlt = selectedImage.alt || '';
-            const newAlt = prompt('Enter alt text for accessibility:', currentAlt);
-            if (newAlt !== null) {
-              import('../utils/imageUtils').then(({ setImageAltText }) => {
-                setImageAltText(selectedImage, newAlt);
-              });
-            }
-          }}
-          onReplace={() => handleImageAction('replace')}
-          onDelete={() => {
-            if (confirm('Delete this image?')) {
-              selectedImage.remove();
-              setSelectedImage(null);
-              toast.success('Image deleted');
-            }
-          }}
-          darkMode={darkMode}
-          language={uiLanguage}
-        />
-      )}
+      {selectedImage && <ImageToolbar darkMode={darkMode} language={uiLanguage} />}
 
       {/* Image Gallery */}
-      {showImageGallery && (
-        <ImageGallery
-          editorElement={editorRef.current?.getInnerHtml() ? document.getElementById('editor-content') : null}
-          onClose={() => setShowImageGallery(false)}
-          onImageSelect={(img) => {
-            img.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            img.click();
-          }}
-          onImageDelete={(img) => {
-            if (confirm('Delete this image?')) {
-              img.remove();
-              toast.success('Image deleted');
-            }
-          }}
-          darkMode={darkMode}
-          language={uiLanguage}
-        />
-      )}
+      {showImageGallery && <ImageGallery onClose={() => setShowImageGallery(false)} darkMode={darkMode} language={uiLanguage} />}
 
       {/* PWA Install Prompt */}
       <InstallPrompt darkMode={darkMode} />
@@ -285,19 +335,17 @@ export const DialogsContainer: React.FC = () => {
         uiLanguage={uiLanguage}
       />
 
+      {/* Device sync (WebDAV / paired devices) */}
+      <SyncManager />
+      <SyncDialog isOpen={showSync} onClose={() => setSyncDialogOpen(false)} darkMode={darkMode} uiLanguage={uiLanguage} />
+
       {/* Toast Notifications */}
       <ToastContainer toasts={toast.toasts} onClose={toast.closeToast} darkMode={darkMode} />
 
       {/* Focus Mode */}
       {showFocusMode && currentDoc && (
         <FocusMode
-          content={currentDoc.content}
-          onChange={(html) => {
-            const div = document.createElement('div');
-            div.innerHTML = html;
-            const text = div.textContent || '';
-            handleContentChange(html, text);
-          }}
+          key={currentDoc.id}
           onExit={() => setShowFocusMode(false)}
           darkMode={darkMode}
           uiLanguage={uiLanguage}

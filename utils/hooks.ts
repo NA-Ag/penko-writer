@@ -1,14 +1,23 @@
 import { useState, useEffect, useRef } from 'react';
 
 /**
- * Hook to detect if the user is on a mobile device
+ * Hook to detect if the user is on a mobile device. `onBeforeChange` runs
+ * right before the value flips (e.g. a phone rotated past the breakpoint), in
+ * the same event, so state it updates lands in the same render.
  */
-export function useIsMobile(breakpoint: number = 768): boolean {
-  const [isMobile, setIsMobile] = useState(false);
+export function useIsMobile(breakpoint: number = 768, onBeforeChange?: () => void): boolean {
+  const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < breakpoint);
+  const currentRef = useRef(isMobile);
+  const beforeChangeRef = useRef(onBeforeChange);
+  beforeChangeRef.current = onBeforeChange;
 
   useEffect(() => {
     const checkMobile = () => {
-      setIsMobile(window.innerWidth < breakpoint);
+      const next = window.innerWidth < breakpoint;
+      if (next === currentRef.current) return;
+      currentRef.current = next;
+      beforeChangeRef.current?.();
+      setIsMobile(next);
     };
 
     // Check initially
@@ -21,49 +30,6 @@ export function useIsMobile(breakpoint: number = 768): boolean {
   }, [breakpoint]);
 
   return isMobile;
-}
-
-/**
- * Hook to detect touch device
- */
-export function useIsTouchDevice(): boolean {
-  const [isTouch, setIsTouch] = useState(false);
-
-  useEffect(() => {
-    setIsTouch(
-      'ontouchstart' in window ||
-      navigator.maxTouchPoints > 0 ||
-      (navigator as any).msMaxTouchPoints > 0
-    );
-  }, []);
-
-  return isTouch;
-}
-
-/**
- * Hook to get window size
- */
-export function useWindowSize() {
-  const [windowSize, setWindowSize] = useState({
-    width: typeof window !== 'undefined' ? window.innerWidth : 1920,
-    height: typeof window !== 'undefined' ? window.innerHeight : 1080,
-  });
-
-  useEffect(() => {
-    function handleResize() {
-      setWindowSize({
-        width: window.innerWidth,
-        height: window.innerHeight,
-      });
-    }
-
-    window.addEventListener('resize', handleResize);
-    handleResize();
-
-    return () => window.removeEventListener('resize', handleResize);
-  }, []);
-
-  return windowSize;
 }
 
 /**
@@ -91,10 +57,13 @@ export function useFocusTrap<T extends HTMLElement>(isActive: boolean) {
       return Array.from(container.querySelectorAll(selector));
     };
 
-    // Focus the first focusable element
-    const focusableElements = getFocusableElements();
-    if (focusableElements.length > 0) {
-      focusableElements[0].focus();
+    // Focus the first focusable element — unless something inside the dialog
+    // already took focus (React `autoFocus` runs before effects), or an element
+    // is explicitly marked with `data-autofocus`.
+    if (!container.contains(document.activeElement)) {
+      const preferred = container.querySelector<HTMLElement>('[data-autofocus], [autofocus]');
+      const focusableElements = getFocusableElements();
+      (preferred || focusableElements[0])?.focus();
     }
 
     // Handle Tab key to trap focus
@@ -136,17 +105,62 @@ export function useFocusTrap<T extends HTMLElement>(isActive: boolean) {
   return containerRef;
 }
 
-/**
- * Hook to announce messages to screen readers using aria-live regions
- * Returns the current announcement text that should be rendered in an aria-live region
+/*
+ * Escape handling for dialogs. One window listener serves a stack of open
+ * dialogs: only the most recently opened one reacts, and only when nothing
+ * inside it (a composer, a menu…) already handled the key. Unlike an
+ * onKeyDown on the dialog element, this keeps working after the focused
+ * element was removed (e.g. a "Retry" button that disappears while loading).
  */
-export function useAriaAnnouncer() {
-  const [announcement, setAnnouncement] = useState('');
+const escapeStack: { current: () => void }[] = [];
+const onEscapeKey = (e: KeyboardEvent) => {
+  if (e.key !== 'Escape' || e.defaultPrevented || !escapeStack.length) return;
+  e.preventDefault();
+  escapeStack[escapeStack.length - 1].current();
+};
 
-  const announce = (message: string) => {
-    setAnnouncement(''); // Clear first to ensure re-announcement
-    setTimeout(() => setAnnouncement(message), 100);
-  };
+export function useEscapeKey(active: boolean, handler: () => void) {
+  const ref = useRef(handler);
+  ref.current = handler;
+  useEffect(() => {
+    if (!active) return;
+    if (!escapeStack.length) window.addEventListener('keydown', onEscapeKey);
+    escapeStack.push(ref);
+    return () => {
+      const i = escapeStack.indexOf(ref);
+      if (i !== -1) escapeStack.splice(i, 1);
+      if (!escapeStack.length) window.removeEventListener('keydown', onEscapeKey);
+    };
+  }, [active]);
+}
 
-  return { announcement, announce };
+/**
+ * App-wide shortcuts that open dialogs (see the keyboard handler in
+ * AppContext). While a full-screen mode covers the app those dialogs would
+ * open hidden underneath it. Returns 'block' (swallow and prevent the browser
+ * default), 'stop' (swallow, keep the browser default: Ctrl+F still opens the
+ * browser's own find bar) or null.
+ */
+export const dialogShortcutAction = (e: Pick<KeyboardEvent, 'key' | 'ctrlKey' | 'metaKey' | 'altKey' | 'shiftKey'>): 'block' | 'stop' | null => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return null;
+  const key = e.key.toLowerCase();
+  if (key === 'f') return 'stop';
+  if (key === 'o' || key === 'h' || key === 'k' || key === '/') return 'block';
+  return null;
+};
+
+/** Swallows dialog-opening app shortcuts while `active` (full-screen modes). */
+export function useSuppressDialogShortcuts(active: boolean) {
+  useEffect(() => {
+    if (!active) return;
+    const onKey = (e: KeyboardEvent) => {
+      const action = dialogShortcutAction(e);
+      if (!action) return;
+      e.stopImmediatePropagation();
+      if (action === 'block') e.preventDefault();
+    };
+    // capture on window: runs before the app's own (bubbling) window listener
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [active]);
 }

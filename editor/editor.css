@@ -1,0 +1,349 @@
+/* ------------------------------------------------------------------ */
+/* Document content styles (shared by the editor, focus mode, previews) */
+/* ------------------------------------------------------------------ */
+
+.penko-doc .ProseMirror {
+  /* Own formatting context: the first block's top margin must not collapse
+     through the editor root, or page positions drift (pagination.ts). */
+  display: flow-root;
+  outline: none;
+  min-height: 100%;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-variant-ligatures: none;
+}
+
+.penko-doc .ProseMirror > * + * {
+  margin-top: 0;
+}
+
+/* Page layout (see editor/extensions/pagination.ts) */
+.penko-page-boundary { user-select: none; cursor: default; }
+.penko-page-boundary > .penko-page-filler,
+.penko-page-boundary > .penko-page-footer-zone,
+.penko-page-boundary > .penko-page-header-zone { background: var(--penko-page-bg, #fff); }
+.penko-page-gap {
+  background: var(--penko-canvas, #f8fafc);
+  box-shadow: inset 0 7px 6px -6px rgba(15, 23, 42, 0.16), inset 0 -7px 6px -6px rgba(15, 23, 42, 0.16);
+}
+.penko-zone {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  padding: 0 var(--penko-page-margin, 96px);
+  font-size: 10pt;
+  line-height: 1.3;
+  font-style: normal;
+  font-weight: normal;
+  text-align: left;
+  text-transform: none;
+  white-space: normal;
+  color: inherit;
+  opacity: 0.85;
+}
+.penko-zone-row { display: flex; width: 100%; gap: 8px; }
+.penko-zone-cell { flex: 1; min-width: 0; overflow: hidden; }
+.penko-page-header-zone:hover .penko-zone,
+.penko-page-footer-zone:hover .penko-zone,
+.penko-first-header:hover .penko-zone,
+.penko-last-footer:hover .penko-zone { opacity: 1; }
+
+/* Headings: Tailwind preflight flattens h1–h6, give them document sizes. */
+.penko-doc h1 { font-size: 2em; font-weight: 700; line-height: 1.2; margin: 0.67em 0 0.4em; }
+.penko-doc h2 { font-size: 1.5em; font-weight: 700; line-height: 1.25; margin: 0.6em 0 0.35em; }
+.penko-doc h3 { font-size: 1.25em; font-weight: 600; line-height: 1.3; margin: 0.5em 0 0.3em; }
+.penko-doc h4 { font-size: 1.1em; font-weight: 600; margin: 0.5em 0 0.25em; }
+.penko-doc h5 { font-size: 1em; font-weight: 600; margin: 0.5em 0 0.25em; }
+.penko-doc h6 { font-size: 0.9em; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; margin: 0.5em 0 0.25em; }
+
+.penko-doc ul { list-style-type: disc; padding-left: 2em; margin-bottom: 0.5em; }
+.penko-doc ul ul { list-style-type: circle; }
+.penko-doc ul ul ul { list-style-type: square; }
+.penko-doc ol { list-style-type: decimal; padding-left: 2em; margin-bottom: 0.5em; }
+.penko-doc ol ol { list-style-type: lower-alpha; }
+.penko-doc ol ol ol { list-style-type: lower-roman; }
+.penko-doc li { margin-bottom: 0.25em; }
+.penko-doc li > p { margin: 0; }
+
+.penko-doc blockquote {
+  border-left: 4px solid #d1d5db;
+  padding-left: 1em;
+  margin: 0.75em 0;
+  color: #4b5563;
+  font-style: italic;
+}
+.penko-doc-dark blockquote { border-left-color: #52525b; color: #a1a1aa; }
+
+.penko-doc a { color: #2563eb; text-decoration: underline; cursor: pointer; }
+.penko-doc-dark a { color: #60a5fa; }
+
+.penko-doc code:not(pre code) {
+  font-family: 'Source Code Pro', 'Courier New', monospace;
+  background: rgba(135, 131, 120, 0.15);
+  border-radius: 3px;
+  padding: 0.1em 0.3em;
+  font-size: 0.9em;
+}
+.penko-doc kbd {
+  font-family: 'Source Code Pro', monospace;
+  font-size: 0.85em;
+  border: 1px solid #d1d5db;
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0 0.35em;
+  background: #f9fafb;
+}
+.penko-doc-dark kbd { border-color: #52525b; background: #27272a; }
+
+.penko-doc hr { border: none; border-top: 1px solid #d1d5db; margin: 1em 0; }
+.penko-doc-dark hr { border-top-color: #52525b; }
+
+.penko-doc mark { border-radius: 2px; padding: 0 1px; }
+
+.penko-doc img { max-width: 100%; height: auto; cursor: pointer; }
+
+/* Tables (same defaults as before) */
+.penko-doc table { width: 100%; border-collapse: collapse; table-layout: auto; margin: 0.5em 0; }
+.penko-doc td,
+.penko-doc th { border: 1px solid #ccc; padding: 4px; min-width: 20px; vertical-align: top; position: relative; }
+.penko-doc th { font-weight: 600; background: rgba(0, 0, 0, 0.03); }
+.penko-doc-dark td,
+.penko-doc-dark th { border-color: #666; }
+.penko-doc td > p,
+.penko-doc th > p { margin: 0; }
+.penko-doc .selectedCell::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgba(59, 130, 246, 0.15);
+  pointer-events: none;
+}
+.penko-doc .column-resize-handle {
+  position: absolute;
+  right: -2px;
+  top: 0;
+  bottom: -2px;
+  width: 4px;
+  background-color: #3b82f6;
+  pointer-events: none;
+}
+.penko-doc.resize-cursor,
+.penko-doc .resize-cursor { cursor: col-resize; }
+.penko-doc .tableWrapper { overflow-x: auto; }
+
+.penko-doc table.table-style-bordered td,
+.penko-doc table.table-style-bordered th { border: 2px solid #333; padding: 8px; }
+.penko-doc-dark table.table-style-bordered td,
+.penko-doc-dark table.table-style-bordered th { border-color: #555; }
+.penko-doc table.table-style-striped td,
+.penko-doc table.table-style-striped th { border: 1px solid #ddd; padding: 6px; }
+.penko-doc table.table-style-striped tr:nth-child(even) { background-color: #f9f9f9; }
+.penko-doc-dark table.table-style-striped tr:nth-child(even) { background-color: #2a2a2a; }
+.penko-doc-dark table.table-style-striped td,
+.penko-doc-dark table.table-style-striped th { border-color: #666; }
+.penko-doc table.table-style-minimal td,
+.penko-doc table.table-style-minimal th { border: none; border-bottom: 1px solid #ddd; padding: 8px; }
+.penko-doc-dark table.table-style-minimal td,
+.penko-doc-dark table.table-style-minimal th { border-bottom-color: #666; }
+
+/* Selection outline for atoms / images */
+.penko-doc .ProseMirror-selectednode,
+.penko-doc [data-resize-container].ProseMirror-selectednode img {
+  outline: 3px solid #3b82f6;
+  outline-offset: 1px;
+}
+.penko-doc .ProseMirror-gapcursor:after { border-top-color: #3b82f6; }
+
+/* Image resize handles (Tiptap resizable node view) */
+.penko-doc [data-resize-container] { max-width: 100%; vertical-align: bottom; }
+.penko-doc [data-resize-container]:has(img[style*='float: left']) { float: left; margin-right: 1em; }
+.penko-doc [data-resize-container]:has(img[style*='float: right']) { float: right; margin-left: 1em; }
+.penko-doc [data-resize-wrapper] { line-height: 0; max-width: 100%; }
+.penko-doc [data-resize-handle] {
+  width: 10px;
+  height: 10px;
+  background: white;
+  border: 2px solid #3b82f6;
+  z-index: 10;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.penko-doc [data-resize-handle='left'],
+.penko-doc [data-resize-handle='right'] { height: 24px; border-radius: 3px; }
+.penko-doc [data-resize-container].ProseMirror-selectednode [data-resize-handle],
+.penko-doc [data-resize-container][data-resize-state='true'] [data-resize-handle] { opacity: 1; }
+
+/* Spell check indicators */
+.penko-doc [spellcheck='true']::spelling-error { text-decoration: wavy underline #ef4444 2px; text-decoration-skip-ink: none; }
+.penko-doc [spellcheck='true']::grammar-error { text-decoration: wavy underline #3b82f6 2px; text-decoration-skip-ink: none; }
+
+/* Comments */
+.penko-doc .comment-highlight {
+  background-color: rgba(255, 193, 7, 0.3);
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+.penko-doc .comment-highlight:hover { background-color: rgba(255, 193, 7, 0.5); }
+@keyframes penko-flash {
+  0%, 100% { background-color: rgba(255, 193, 7, 0.3); }
+  50% { background-color: rgba(255, 193, 7, 0.8); }
+}
+.penko-doc .comment-flash { animation: penko-flash 1s ease-in-out; }
+
+/* Track changes */
+.penko-doc ins.track-insert { color: #15803d; text-decoration: underline; text-decoration-color: #22c55e; background: rgba(34, 197, 94, 0.08); }
+.penko-doc del.track-delete { color: #b91c1c; text-decoration: line-through; text-decoration-color: #ef4444; background: rgba(239, 68, 68, 0.08); }
+.penko-doc-dark ins.track-insert { color: #4ade80; }
+.penko-doc-dark del.track-delete { color: #f87171; }
+
+/* Find & replace */
+.penko-doc .search-match { background-color: rgba(250, 204, 21, 0.45); border-radius: 2px; }
+.penko-doc .search-match-current { background-color: rgba(249, 115, 22, 0.65); outline: 1px solid #f97316; }
+
+/* Footnotes, citations, equations */
+.penko-doc .penko-note-ref,
+.penko-doc sup[data-type='footnote'] { color: #3b82f6; cursor: pointer; font-weight: 700; padding: 0 1px; }
+.penko-doc .citation { color: inherit; border-bottom: 1px dotted #3b82f6; cursor: default; }
+.penko-doc .citation-missing { color: #b91c1c; }
+.penko-doc .katex-equation { margin: 0 4px; cursor: pointer; }
+.penko-doc .katex-equation:hover { background: rgba(59, 130, 246, 0.08); border-radius: 3px; }
+
+/* Page break */
+.penko-doc div[data-type='page-break'] {
+  height: 0;
+  border-top: 1px dashed #cbd5e1;
+  margin: 12px 0;
+  position: relative;
+}
+.penko-doc div[data-type='page-break']::after {
+  content: var(--penko-page-break-label, 'Page break');
+  position: absolute;
+  left: 50%;
+  top: -8px;
+  transform: translateX(-50%);
+  font-size: 10px;
+  padding: 0 6px;
+  color: #94a3b8;
+  background: inherit;
+}
+.penko-doc-dark div[data-type='page-break'] { border-top-color: #3f3f46; }
+
+/* Section break (next page) */
+.penko-doc div[data-type='section-break'] {
+  height: 0;
+  border-top: 2px double #93c5fd;
+  margin: 12px 0;
+  position: relative;
+}
+.penko-doc div[data-type='section-break']::after {
+  content: var(--penko-section-break-label, 'Section break (next page)');
+  position: absolute;
+  left: 50%;
+  top: -8px;
+  transform: translateX(-50%);
+  font-size: 10px;
+  padding: 0 6px;
+  color: #60a5fa;
+  background: var(--penko-page-bg, #fff);
+}
+@media print {
+  .penko-doc div[data-type='section-break'] { border: none; margin: 0; }
+  .penko-doc div[data-type='section-break']::after { content: none; }
+}
+
+/* Table of contents in dark mode keeps readable text */
+.penko-doc-dark .table-of-contents[style*='background: #f9fafb'] { color: #111827; }
+
+/* Screenplay mode (Final Draft-style layout) */
+.screenplay-mode .ProseMirror {
+  font-family: Courier, 'Courier New', monospace;
+  font-size: 12pt;
+  line-height: 1.5;
+}
+.screenplay-mode p { font-family: Courier, 'Courier New', monospace; font-size: 12pt; line-height: 1.5; margin: 0; }
+.penko-doc p.screenplay-scene-heading { text-transform: uppercase; font-weight: bold; margin-top: 24px; margin-bottom: 12px; }
+.penko-doc p.screenplay-action { margin-bottom: 12px; }
+.penko-doc p.screenplay-character { text-transform: uppercase; margin-left: 3.7in; margin-top: 12px; margin-bottom: 0; }
+.penko-doc p.screenplay-parenthetical { margin-left: 3.1in; margin-bottom: 0; }
+.penko-doc p.screenplay-dialogue { margin-left: 2.5in; max-width: 3.5in; margin-bottom: 12px; }
+.penko-doc p.screenplay-transition { text-transform: uppercase; text-align: right; margin-top: 12px; margin-bottom: 12px; }
+
+/* Collaboration carets */
+.collaboration-carets__caret {
+  border-left: 1px solid #0d0d0d;
+  border-right: 1px solid #0d0d0d;
+  margin-left: -1px;
+  margin-right: -1px;
+  pointer-events: none;
+  position: relative;
+  word-break: normal;
+}
+.collaboration-carets__label {
+  border-radius: 3px 3px 3px 0;
+  color: #0d0d0d;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 600;
+  left: -1px;
+  line-height: normal;
+  padding: 0.1rem 0.3rem;
+  position: absolute;
+  top: -1.4em;
+  user-select: none;
+  white-space: nowrap;
+}
+
+@media print {
+  .penko-doc [data-resize-handle] { display: none !important; }
+  .penko-doc .search-match,
+  .penko-doc .search-match-current { background: none !important; outline: none !important; }
+  .penko-doc div[data-type='page-break'] { border: none; margin: 0; }
+  .penko-doc div[data-type='page-break']::after { content: none; }
+}
+
+/* Tracked paragraph breaks (Enter / joining paragraphs with track changes on) */
+.penko-doc .track-break-insert::before,
+.penko-doc .track-break-delete::before {
+  content: '¶';
+  font-weight: 700;
+  margin-right: 2px;
+  user-select: none;
+}
+.penko-doc .track-break-insert::before { color: #16a34a; }
+.penko-doc .track-break-delete::before { color: #dc2626; text-decoration: line-through; }
+@media print {
+  .penko-doc .track-break-insert::before,
+  .penko-doc .track-break-delete::before { content: none; }
+}
+
+/* Footnotes at the bottom of each page (pagination.ts). The same rules apply to
+   the off-screen measurer, so measured heights match what is drawn. Explicit
+   font properties: page-break widgets can sit inside a styled paragraph. */
+.penko-page-notes-zone,
+.penko-last-notes { padding: 0 var(--penko-page-margin, 96px); box-sizing: border-box; background: var(--penko-page-bg, #fff); }
+.penko-page-notes {
+  font-family: 'Calibri', 'Arial', sans-serif;
+  font-size: 9pt;
+  line-height: 1.3;
+  font-weight: normal;
+  font-style: normal;
+  text-align: left;
+  text-transform: none;
+  text-indent: 0;
+  letter-spacing: normal;
+  white-space: normal;
+  color: inherit;
+}
+.penko-page-notes-separator { position: relative; }
+.penko-page-notes-separator::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 33%;
+  border-top: 1px solid currentColor;
+  opacity: 0.35;
+}
+.penko-page-note { cursor: pointer; }
+.penko-page-note:hover { text-decoration: underline; }
+.penko-page-note sup { color: #3b82f6; font-weight: 700; margin-right: 1px; }
